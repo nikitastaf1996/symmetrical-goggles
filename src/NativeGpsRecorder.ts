@@ -7,12 +7,16 @@
 
 import { NativeModules, DeviceEventEmitter, EmitterSubscription } from 'react-native';
 
+export type GpsFixType = 'no fix' | '2D fix' | '3D fix';
+
 export type GpsLocationEvent = {
   lat: number;
   lon: number;
   alt: number | null;
   speed: number | null; // m/s
   accuracy: number | null; // meters
+  fixType: GpsFixType;   // GNSS fix status (no fix / 2D fix / 3D fix)
+  distance: number;      // total distance traveled so far, meters
   timestamp: number; // epoch ms
   pointCount: number;
 };
@@ -40,6 +44,8 @@ export type GpsFullState = {
   isRecording: boolean;
   pointCount: number;
   elapsedMs: number;
+  distance: number;          // total distance traveled, meters
+  fixType: GpsFixType;       // GNSS fix status
   lastFix: GpsLocationEvent | null;
 };
 
@@ -68,7 +74,14 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   start: async () => {},
   stop: async () => {},
   isRecording: async () => false,
-  getState: async () => ({ isRecording: false, pointCount: 0, elapsedMs: 0, lastFix: null }),
+  getState: async () => ({
+    isRecording: false,
+    pointCount: 0,
+    elapsedMs: 0,
+    distance: 0,
+    fixType: 'no fix' as GpsFixType,
+    lastFix: null,
+  }),
   requestPermissions: async () => false,
   hasPermissions: async () => false,
   requestIgnoreBatteryOptimizations: async () => false,

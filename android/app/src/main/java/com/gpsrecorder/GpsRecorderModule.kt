@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.core.content.ContextCompat
@@ -32,7 +34,7 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  *   - removeListeners(Integer)     -> required by NativeEventEmitter
  *
  * Events emitted to JS:
- *   - "location"  { lat, lon, alt, speed, accuracy, timestamp }
+ *   - "location"  { lat, lon, alt, speed, accuracy, fixType, distance, timestamp, pointCount }
  *   - "duration"  { elapsedMs }
  *   - "state"     { isRecording, pointCount, elapsedMs }
  *   - "saved"     { filePath, pointCount }
@@ -47,7 +49,11 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         @Volatile private var instance: GpsRecorderModule? = null
 
         // ---- Event emitters called from GpsRecorderService ----
-        fun emitLocation(lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?, timestamp: Long, pointCount: Int) {
+        fun emitLocation(
+            lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?,
+            fixType: String, distanceMeters: Double,
+            timestamp: Long, pointCount: Int
+        ) {
             val module = instance ?: return
             val map = Arguments.createMap().apply {
                 putDouble("lat", lat)
@@ -55,6 +61,8 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 if (alt != null) putDouble("alt", alt) else putNull("alt")
                 if (speed != null) putDouble("speed", speed.toDouble()) else putNull("speed")
                 if (accuracy != null) putDouble("accuracy", accuracy.toDouble()) else putNull("accuracy")
+                putString("fixType", fixType)
+                putDouble("distance", distanceMeters)
                 putDouble("timestamp", timestamp.toDouble())
                 putInt("pointCount", pointCount)
             }
@@ -146,9 +154,10 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     }
 
     /**
-     * Returns the current recording state, point count, elapsed time, and last GPS fix.
-     * JS calls this on mount and every 2 seconds while recording as a reliable fallback
-     * in case the event emitter is not delivering events.
+     * Returns the current recording state, point count, elapsed time, last GPS fix,
+     * total distance traveled, and current GNSS fix type. JS calls this on mount and
+     * every 2 seconds while recording as a reliable fallback in case the event
+     * emitter is not delivering events.
      */
     @ReactMethod
     fun getState(promise: Promise) {
@@ -158,11 +167,15 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             val startTime = prefs.getLong("start_time_ms", 0L)
             val count = prefs.getInt("point_count", 0)
             val elapsed = if (isRec && startTime > 0) System.currentTimeMillis() - startTime else 0L
+            val distance = prefs.getString("total_distance_m", "0")?.toDoubleOrNull() ?: 0.0
+            val fixType = prefs.getString("fix_type", "no fix") ?: "no fix"
 
             val map = Arguments.createMap().apply {
                 putBoolean("isRecording", isRec)
                 putInt("pointCount", count)
                 putDouble("elapsedMs", elapsed.toDouble())
+                putDouble("distance", distance)
+                putString("fixType", fixType)
 
                 val lastLat = prefs.getString("last_lat", null)
                 val lastLon = prefs.getString("last_lon", null)
@@ -176,6 +189,8 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                         if (spd != null) putDouble("speed", spd.toDouble()) else putNull("speed")
                         val acc = prefs.getString("last_accuracy", "")?.takeIf { it.isNotEmpty() }
                         if (acc != null) putDouble("accuracy", acc.toDouble()) else putNull("accuracy")
+                        putString("fixType", fixType)
+                        putDouble("distance", distance)
                         putDouble("timestamp", prefs.getLong("last_time_ms", 0L).toDouble())
                     }
                     putMap("lastFix", fix)
@@ -192,17 +207,26 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun requestPermissions(promise: Promise) {
         try {
-            // We can't directly request permissions from a non-Activity context here without
-            // launching an Activity. The MainActivity hosts the permission request and reads
-            // the result back. For simplicity, we launch the system permission dialog via
-            // an Intent, and return whether we ALREADY have all permissions.
-            val allGranted = hasAllPermissions()
-            if (allGranted) {
+            if (hasAllPermissions()) {
                 promise.resolve(true)
                 return
             }
-            // Otherwise, request via MainActivity (handled in MainApplication / MainActivity)
-            MainActivity.requestRequiredPermissions(reactContext.currentActivity as? MainActivity)
+            val activity = reactContext.currentActivity as? MainActivity
+            if (activity != null) {
+                activity.requestAllPermissionsFromJs()
+            } else {
+                // Activity not yet attached (e.g. JS mounted before MainActivity resumed).
+                // Retry shortly on the main thread.
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try {
+                        (reactContext.currentActivity as? MainActivity)?.requestAllPermissionsFromJs()
+                    } catch (e: Exception) {
+                        android.util.Log.w(TAG, "Deferred permission request failed", e)
+                    }
+                }, 500L)
+            }
+            // Return the current state — JS will poll hasPermissions() separately
+            // to detect when the user has actually granted the permissions.
             promise.resolve(hasAllPermissions())
         } catch (e: Exception) {
             promise.reject("E_PERM", e.message ?: "Permission error", e)

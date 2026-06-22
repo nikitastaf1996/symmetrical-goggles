@@ -3,6 +3,7 @@ package com.gpsrecorder
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Log
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.facebook.react.ReactActivity
@@ -13,28 +14,53 @@ import com.facebook.react.defaults.DefaultReactActivityDelegate
 class MainActivity : ReactActivity() {
 
     companion object {
+        private const val TAG = "MainActivity"
+
         @Volatile private var instance: MainActivity? = null
 
         /**
-         * Called from GpsRecorderModule.requestPermissions(). If the activity is alive,
-         * we kick off the permission request pipeline; otherwise the caller must call
-         * us again when the activity is foregrounded.
+         * Process-wide flag: becomes true the first time we successfully fire the
+         * permission dialog in this process. Prevents spamming the user with dialogs
+         * on every onResume / onWindowFocusChanged.
+         *
+         * Reset to false automatically when the app process dies, so the next cold
+         * start asks again (which is what we want).
+         */
+        @Volatile private var hasRequestedInThisProcess = false
+
+        /**
+         * Called from GpsRecorderModule.requestPermissions(). Always tries to launch
+         * the system permission dialog (ignores the auto-launch flag), because the
+         * user explicitly tapped the "Grant permissions" button.
          */
         fun requestRequiredPermissions(activity: MainActivity?) {
-            activity?.requestAllPermissions()
+            activity?.requestAllPermissionsFromJs()
         }
     }
 
-    private var hasRequestedPermissionsOnLaunch = false
+    /**
+     * Per-instance flag. Set when we attempted the auto-launch on this activity
+     * instance. Used together with [hasRequestedInThisProcess] to deduplicate
+     * triggers from onResume / onWindowFocusChanged / onPostResume.
+     */
+    private var hasAutoRequestedOnThisInstance = false
 
-    private val requiredPermissions: Array<String> by lazy {
+    /**
+     * Core permissions to request up-front.
+     *
+     * NOTE: ACCESS_BACKGROUND_LOCATION is deliberately NOT in this list. On
+     * Android 11+ (API 30+), requesting ACCESS_BACKGROUND_LOCATION together
+     * with the foreground location permissions causes the system to silently
+     * ignore the entire batch (or show a confusing dialog). The correct
+     * pattern is to request foreground location first, then ask for background
+     * location separately after the user grants foreground. We do that in
+     * [locationPermissionLauncher]'s callback.
+     */
+    private val corePermissions: Array<String> by lazy {
         val base = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            base.add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             base.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -42,25 +68,17 @@ class MainActivity : ReactActivity() {
     }
 
     private val locationPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-            // After core permissions, if Android 10+, request background location separately
-            // (Android requires asking for it after the user has accepted fine location).
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val fineGranted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                    ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
-                        PackageManager.PERMISSION_GRANTED
-                if (fineGranted) {
-                    try {
-                        backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-                    } catch (e: Exception) {
-                        // Some devices throw if the activity state is wrong; ignore.
-                    }
-                }
-            }
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { _ ->
+            // After the core batch resolves, ask for background location separately
+            // (only if fine location was granted). Android 10+ requires this to be
+            // a separate, follow-up request.
+            requestBackgroundLocationIfPossible()
         }
 
     private val backgroundLocationLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> /* result ignored */ }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+            /* result ignored — best-effort */
+        }
 
     override fun getMainComponentName(): String = "trck"
 
@@ -70,21 +88,91 @@ class MainActivity : ReactActivity() {
     override fun onResume() {
         super.onResume()
         instance = this
-        // Auto-request permissions on the first resume so the user doesn't have to
-        // grant them manually from Android Settings.
-        //
-        // We post this to the decorView's message queue so that the activity is fully
-        // attached and resumed before we try to launch the permission contract.
-        // Launching the contract synchronously inside onResume can silently fail on
-        // some Android versions because the activity is not yet in STARTED state
-        // from the ActivityResultRegistry's point of view.
-        if (!hasRequestedPermissionsOnLaunch) {
-            hasRequestedPermissionsOnLaunch = true
-            window.decorView.post {
+        // Auto-request on first resume so the user doesn't have to grant permissions
+        // manually from Android Settings.
+        maybeAutoRequestPermissions()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Fallback trigger: some devices/ROMs fire onResume before the activity is
+        // truly ready to launch the ActivityResult contract. If we still don't have
+        // permissions when the window gets focus, try again.
+        if (hasFocus) {
+            maybeAutoRequestPermissions()
+        }
+    }
+
+    /**
+     * Auto-request permissions once per process. Safe to call from multiple
+     * lifecycle hooks — deduplicates via [hasRequestedInThisProcess].
+     */
+    private fun maybeAutoRequestPermissions() {
+        if (hasRequestedInThisProcess) return
+        if (hasAutoRequestedOnThisInstance) return
+        if (hasAllPermissions()) return
+
+        // Mark immediately to prevent concurrent triggers from double-firing.
+        // We reset to false if the actual launch() call throws.
+        hasRequestedInThisProcess = true
+        hasAutoRequestedOnThisInstance = true
+
+        // Post to the decorView's queue so the activity is fully attached and
+        // resumed before we try to launch the ActivityResult contract. Launching
+        // synchronously inside onResume can silently fail on some Android versions
+        // because the activity is not yet in STARTED state from the
+        // ActivityResultRegistry's point of view.
+        window.decorView.post {
+            try {
                 if (!hasAllPermissions()) {
-                    requestAllPermissions()
+                    locationPermissionLauncher.launch(corePermissions)
+                    Log.i(TAG, "Auto-requested core permissions: ${corePermissions.toList()}")
                 }
+            } catch (e: Exception) {
+                // Reset flags so we can retry on the next trigger (next resume,
+                // next window focus change, or next JS call).
+                hasRequestedInThisProcess = false
+                hasAutoRequestedOnThisInstance = false
+                Log.w(TAG, "Permission launch failed, will retry on next trigger", e)
             }
+        }
+    }
+
+    /**
+     * Called from JS via [GpsRecorderModule.requestPermissions]. Always tries to
+     * launch the dialog (the user explicitly asked), regardless of the auto-launch
+     * flags.
+     */
+    fun requestAllPermissionsFromJs() {
+        // Mark as requested so onResume / onWindowFocusChanged don't double-fire.
+        hasRequestedInThisProcess = true
+        hasAutoRequestedOnThisInstance = true
+
+        window.decorView.post {
+            try {
+                if (!hasAllPermissions()) {
+                    locationPermissionLauncher.launch(corePermissions)
+                    Log.i(TAG, "JS-requested core permissions: ${corePermissions.toList()}")
+                }
+            } catch (e: Exception) {
+                // Reset so the auto-launch path can try again later.
+                hasAutoRequestedOnThisInstance = false
+                Log.w(TAG, "Permission launch from JS failed", e)
+            }
+        }
+    }
+
+    private fun requestBackgroundLocationIfPossible() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val fineGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!fineGranted) return
+        try {
+            backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        } catch (e: Exception) {
+            // Some devices throw if the activity state is wrong; ignore.
+            Log.w(TAG, "Background location launch failed", e)
         }
     }
 
@@ -98,21 +186,5 @@ class MainActivity : ReactActivity() {
             ) == PackageManager.PERMISSION_GRANTED
         } else true
         return fineGranted && notifGranted
-    }
-
-    fun requestAllPermissions() {
-        try {
-            // Post again to be extra-safe: launching from a non-resumed state throws
-            // IllegalStateException on some devices.
-            window.decorView.post {
-                try {
-                    locationPermissionLauncher.launch(requiredPermissions)
-                } catch (e: Exception) {
-                    // ignore
-                }
-            }
-        } catch (e: Exception) {
-            // Some devices throw if the activity is not in a state to launch.
-        }
     }
 }

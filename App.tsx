@@ -1,10 +1,11 @@
 /**
  * GPS Recorder
  *
- * A no-frills GPS recording app:
+ * A no-frills GPS recording app for runners:
  *   - Big Start / Stop button
  *   - Duration of recording
- *   - Live GPS fix info (lat / lon / accuracy / speed)
+ *   - Distance traveled + current pace (min/km)
+ *   - Live GPS fix info (lat / lon / accuracy / GNSS status / speed)
  *   - Number of points recorded
  *   - Path to the saved GPX file
  *
@@ -47,6 +48,7 @@ import {
   type GpsStateEvent,
   type GpsSavedEvent,
   type GpsFullState,
+  type GpsFixType,
 } from './src/NativeGpsRecorder';
 
 type RecordingState = 'idle' | 'recording' | 'stopping';
@@ -64,10 +66,45 @@ function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
 }
 
+/**
+ * Formats a distance in meters as a runner-friendly string:
+ *  - < 1000 m  -> "123 m"
+ *  - >= 1000 m -> "1.23 km" (2 decimals)
+ */
+function formatDistance(distanceM: number): string {
+  if (!distanceM || distanceM <= 0) return '0 m';
+  if (distanceM < 1000) return `${Math.round(distanceM)} m`;
+  return `${(distanceM / 1000).toFixed(2)} km`;
+}
+
+/**
+ * Formats pace (minutes per km) from elapsed time and distance.
+ * Returns "—" if there's no measurable distance or elapsed time yet.
+ *
+ * Pace is shown as "M:SS" — e.g. 5 min 30 sec per km = "5:30".
+ * For very slow paces (> 15:00/km, basically walking or standing),
+ * we still show the number; that's useful feedback.
+ */
+function formatPace(elapsedMs: number, distanceM: number): string {
+  if (!distanceM || distanceM < 1) return '—';
+  if (!elapsedMs || elapsedMs < 1000) return '—';
+  const minutesTotal = elapsedMs / 60000.0;            // elapsed minutes
+  const km = distanceM / 1000.0;                        // distance in km
+  const paceMinPerKm = minutesTotal / km;               // minutes per km
+  if (!isFinite(paceMinPerKm) || paceMinPerKm <= 0) return '—';
+  const wholeMin = Math.floor(paceMinPerKm);
+  const sec = Math.round((paceMinPerKm - wholeMin) * 60);
+  // Handle the round-up-to-60 edge case (e.g. 5:59.6 -> 6:00)
+  if (sec === 60) return `${wholeMin + 1}:00`;
+  return `${wholeMin}:${pad2(sec)}`;
+}
+
 function App(): React.ReactElement {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
   const [elapsedMs, setElapsedMs] = useState<number>(0);
   const [pointCount, setPointCount] = useState<number>(0);
+  const [distance, setDistance] = useState<number>(0);
+  const [fixType, setFixType] = useState<GpsFixType>('no fix');
   const [lastFix, setLastFix] = useState<GpsLocationEvent | null>(null);
   const [lastSavedPath, setLastSavedPath] = useState<string | null>(null);
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
@@ -82,6 +119,8 @@ function App(): React.ReactElement {
         setRecordingState((prev) => (prev === 'stopping' ? prev : 'recording'));
         setPointCount(state.pointCount);
         setElapsedMs(state.elapsedMs);
+        if (typeof state.distance === 'number') setDistance(state.distance);
+        if (state.fixType) setFixType(state.fixType);
         if (state.lastFix) {
           setLastFix(state.lastFix);
         }
@@ -123,6 +162,12 @@ function App(): React.ReactElement {
         if (ev.pointCount != null) {
           setPointCount(ev.pointCount);
         }
+        if (typeof ev.distance === 'number') {
+          setDistance(ev.distance);
+        }
+        if (ev.fixType) {
+          setFixType(ev.fixType);
+        }
       }),
       subscribe('duration', (ev) => {
         setElapsedMs(ev.elapsedMs);
@@ -140,6 +185,9 @@ function App(): React.ReactElement {
           setRecordingState('idle');
           setPointCount(0);
           setElapsedMs(0);
+          setDistance(0);
+          setFixType('no fix');
+          setLastFix(null);
           startTimeRef.current = null;
         }
       }),
@@ -147,6 +195,8 @@ function App(): React.ReactElement {
         setLastSavedPath(ev.filePath);
         setPointCount(0);
         setElapsedMs(0);
+        setDistance(0);
+        setFixType('no fix');
         setLastFix(null);
         setRecordingState('idle');
         startTimeRef.current = null;
@@ -166,7 +216,7 @@ function App(): React.ReactElement {
     });
 
     // Polling fallback: every 2 seconds, sync state from native.
-    // This guarantees point count / latest fix / duration are always fresh
+    // This guarantees point count / latest fix / duration / distance are always fresh
     // even if the event emitter drops events.
     const pollInterval = setInterval(() => {
       syncStateFromNative();
@@ -213,6 +263,8 @@ function App(): React.ReactElement {
 
       setElapsedMs(0);
       setPointCount(0);
+      setDistance(0);
+      setFixType('no fix');
       setLastFix(null);
       setLastSavedPath(null);
       startTimeRef.current = Date.now();
@@ -296,16 +348,32 @@ function App(): React.ReactElement {
           </Pressable>
         )}
 
+        {/* Primary runner stats: distance + pace */}
+        <View style={styles.statsGrid}>
+          <StatCard
+            label="DISTANCE"
+            value={formatDistance(distance)}
+          />
+          <StatCard
+            label="PACE"
+            value={formatPace(elapsedMs, distance)}
+            sub="/km"
+          />
+        </View>
+
+        {/* Secondary stats: points + accuracy (with GNSS status) + speed */}
         <View style={styles.statsGrid}>
           <StatCard label="POINTS" value={String(pointCount)} />
           <StatCard
             label="ACCURACY"
             value={lastFix?.accuracy != null ? `${lastFix.accuracy.toFixed(0)} m` : '—'}
+            sub={fixType}
+            subStyle={fixTypeStyle(fixType)}
           />
           <StatCard
             label="SPEED"
             value={
-              lastFix?.speed != null
+              lastFix?.speed != null && lastFix.speed > 0
                 ? `${(lastFix.speed * 3.6).toFixed(1)} km/h`
                 : '—'
             }
@@ -329,6 +397,10 @@ function App(): React.ReactElement {
                 {lastFix.alt.toFixed(1)} m
               </Text>
             )}
+            <Text style={styles.fixLine}>
+              <Text style={styles.fixLabel}>GNSS </Text>
+              {fixType}
+            </Text>
             <Text style={styles.fixLine}>
               <Text style={styles.fixLabel}>Time </Text>
               {new Date(lastFix.timestamp).toLocaleTimeString()}
@@ -361,13 +433,43 @@ function App(): React.ReactElement {
   );
 }
 
-function StatCard({ label, value }: { label: string; value: string }): React.ReactElement {
+function StatCard({
+  label,
+  value,
+  sub,
+  subStyle,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  subStyle?: { color: string };
+}): React.ReactElement {
   return (
     <View style={styles.statCard}>
       <Text style={styles.statLabel}>{label}</Text>
-      <Text style={styles.statValue}>{value}</Text>
+      <View style={styles.statValueRow}>
+        <Text style={styles.statValue}>{value}</Text>
+        {sub != null && <Text style={[styles.statSub, subStyle]}>{sub}</Text>}
+      </View>
     </View>
   );
+}
+
+/**
+ * Picks a color for the GNSS fix type chip next to the accuracy value.
+ *  - 3D fix -> green (good)
+ *  - 2D fix -> amber (marginal)
+ *  - no fix -> red (no signal)
+ */
+function fixTypeStyle(fixType: GpsFixType): { color: string } {
+  switch (fixType) {
+    case '3D fix':
+      return { color: '#22C55E' };
+    case '2D fix':
+      return { color: '#F59E0B' };
+    default:
+      return { color: '#EF4444' };
+  }
 }
 
 const styles = StyleSheet.create({
@@ -408,14 +510,18 @@ const styles = StyleSheet.create({
     alignItems: 'center', marginBottom: 16, borderWidth: 1, borderColor: '#334155',
   },
   permissionButtonText: { color: '#F8FAFC', fontSize: 14, fontWeight: '600' },
-  statsGrid: { flexDirection: 'row', gap: 10, marginBottom: 16 },
+  statsGrid: { flexDirection: 'row', gap: 10, marginBottom: 10 },
   statCard: {
     flex: 1, backgroundColor: '#1E293B', borderRadius: 12, padding: 14, alignItems: 'center',
   },
   statLabel: { fontSize: 10, color: '#64748B', letterSpacing: 1.5, fontWeight: '600' },
+  statValueRow: { flexDirection: 'row', alignItems: 'baseline', marginTop: 4, gap: 4 },
   statValue: {
-    fontSize: 20, color: '#F8FAFC', fontWeight: '600', marginTop: 4,
+    fontSize: 20, color: '#F8FAFC', fontWeight: '600',
     fontVariant: ['tabular-nums'],
+  },
+  statSub: {
+    fontSize: 11, color: '#94A3B8', fontWeight: '600', letterSpacing: 0.5,
   },
   fixCard: { backgroundColor: '#1E293B', borderRadius: 12, padding: 16, marginBottom: 16 },
   fixTitle: { fontSize: 11, color: '#64748B', letterSpacing: 1.5, fontWeight: '700', marginBottom: 8 },

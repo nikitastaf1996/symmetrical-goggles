@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -72,6 +73,9 @@ class GpsRecorderService : Service(), LocationListener {
         private const val KEY_START_TIME = "start_time_ms"
         private const val KEY_POINT_COUNT = "point_count"
         private const val KEY_TEMP_FILE_NAME = "temp_file_name"
+        private const val KEY_TOTAL_DISTANCE = "total_distance_m"
+        private const val KEY_FIX_TYPE = "fix_type"
+        private const val KEY_SATELLITES_USED = "satellites_used"
         // Last fix (updated on every GPS callback so JS can poll via getState())
         private const val KEY_LAST_LAT = "last_lat"
         private const val KEY_LAST_LON = "last_lon"
@@ -86,6 +90,13 @@ class GpsRecorderService : Service(), LocationListener {
 
         // How often we flush points to disk (for crash recovery)
         private const val FLUSH_INTERVAL_MS = 5000L
+
+        // If no GPS fix for this long, treat GNSS status as "no fix"
+        private const val NO_FIX_TIMEOUT_MS = 10_000L
+
+        // Minimum number of points that must exist before distance starts accumulating,
+        // so a single noisy first fix doesn't shift the total by a large jump.
+        private const val ACCURACY_THRESHOLD_M = 50.0f  // ignore fixes worse than this
     }
 
     private var locationManager: LocationManager? = null
@@ -97,6 +108,18 @@ class GpsRecorderService : Service(), LocationListener {
     private var startTimeMs: Long = 0L
     private var pointCount: Int = 0
     private var tempFileName: String? = null
+
+    // Distance accumulator (meters). Persisted so it survives service restarts.
+    @Volatile private var totalDistanceM: Double = 0.0
+
+    // GNSS status tracking (satellites used in current fix).
+    @Volatile private var satellitesUsed: Int = 0
+    @Volatile private var lastFixTimeMs: Long = 0L
+    private var gnssStatusCallback: GnssStatus.Callback? = null
+
+    // Previous point used for distance accumulation (Haversine between consecutive fixes).
+    @Volatile private var prevLat: Double? = null
+    @Volatile private var prevLon: Double? = null
 
     // In-memory buffer of GPX points; also persisted to temp file periodically
     private val pointBuffer = ArrayList<GpsPoint>(1024)
@@ -199,6 +222,11 @@ class GpsRecorderService : Service(), LocationListener {
         if (!resume) {
             startTimeMs = System.currentTimeMillis()
             pointCount = 0
+            totalDistanceM = 0.0
+            prevLat = null
+            prevLon = null
+            satellitesUsed = 0
+            lastFixTimeMs = 0L
             synchronized(pointBufferLock) { pointBuffer.clear() }
             tempFileName = "gps_temp_${startTimeMs}.gpx"
         }
@@ -214,8 +242,9 @@ class GpsRecorderService : Service(), LocationListener {
         // startForegroundService()).
         startForegroundIfNeeded()
 
-        // Start GPS
+        // Start GPS + GNSS status tracking
         startLocationUpdates()
+        startGnssStatusTracking()
 
         // Start duration tick + periodic flush
         handler.post(durationTick)
@@ -243,6 +272,7 @@ class GpsRecorderService : Service(), LocationListener {
         handler.removeCallbacks(durationTick)
         handler.removeCallbacks(flushTick)
         stopLocationUpdates()
+        stopGnssStatusTracking()
 
         // Final flush + finalize the GPX file
         val savedFilePath = finalizeGpxFile()
@@ -409,6 +439,65 @@ class GpsRecorderService : Service(), LocationListener {
         locationManager?.removeUpdates(this)
     }
 
+    // ------------------------------------------------------------------
+    // GNSS status (satellite count for fix-type display)
+    // ------------------------------------------------------------------
+
+    /**
+     * Registers a GnssStatus callback to track how many satellites are used in
+     * the current fix. Used by [computeFixType] to distinguish 2D vs 3D fixes.
+     */
+    private fun startGnssStatusTracking() {
+        val lm = locationManager ?: return
+        if (gnssStatusCallback != null) return  // already registered
+        val cb = object : GnssStatus.Callback() {
+            override fun onSatelliteStatusChanged(status: GnssStatus) {
+                var used = 0
+                for (i in 0 until status.satelliteCount) {
+                    if (status.usedInFix(i)) used++
+                }
+                satellitesUsed = used
+                // Persist so JS can poll via getState() even without a new location event.
+                try {
+                    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                        .edit()
+                        .putInt(KEY_SATELLITES_USED, used)
+                        .putString(KEY_FIX_TYPE, computeFixType())
+                        .apply()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to persist GNSS status", e)
+                }
+            }
+
+            override fun onStarted() {
+                Log.i(TAG, "GNSS engine started")
+            }
+
+            override fun onStopped() {
+                Log.i(TAG, "GNSS engine stopped")
+                satellitesUsed = 0
+            }
+        }
+        try {
+            lm.registerGnssStatusCallback(cb, Handler(Looper.getMainLooper()))
+            gnssStatusCallback = cb
+            Log.i(TAG, "Registered GNSS status callback")
+        } catch (e: Exception) {
+            Log.w(TAG, "registerGnssStatusCallback failed", e)
+        }
+    }
+
+    private fun stopGnssStatusTracking() {
+        val cb = gnssStatusCallback ?: return
+        try {
+            locationManager?.unregisterGnssStatusCallback(cb)
+        } catch (e: Exception) {
+            Log.w(TAG, "unregisterGnssStatusCallback failed", e)
+        }
+        gnssStatusCallback = null
+        satellitesUsed = 0
+    }
+
     override fun onLocationChanged(location: Location) {
         if (!isRecording) return
         val pt = GpsPoint(
@@ -423,12 +512,76 @@ class GpsRecorderService : Service(), LocationListener {
             pointBuffer.add(pt)
             pointCount = pointBuffer.size
         }
+        // Update distance accumulator (Haversine between consecutive fixes).
+        // Skip fixes with poor accuracy so GPS noise doesn't inflate the total.
+        accumulateDistance(pt)
+        // Record fix time for GNSS status timeout detection.
+        lastFixTimeMs = pt.timeMs
         // Save current state to SharedPreferences so JS can poll via getState()
         // even if the event emitter is not delivering events reliably.
         saveLiveState(pt)
         // Emit the event with pointCount included so the JS UI updates in real time.
-        GpsRecorderModule.emitLocation(pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy, pt.timeMs, pointCount)
+        GpsRecorderModule.emitLocation(
+            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+            computeFixType(), totalDistanceM, pt.timeMs, pointCount
+        )
         updateNotification()
+    }
+
+    /**
+     * Adds the Haversine distance between [pt] and the previous accepted fix to
+     * [totalDistanceM]. Filters out fixes with poor accuracy to avoid GPS noise
+     * inflating the distance.
+     */
+    private fun accumulateDistance(pt: GpsPoint) {
+        val acc = pt.accuracy
+        if (acc != null && acc > ACCURACY_THRESHOLD_M) {
+            // Fix too inaccurate to trust for distance — skip but don't reset prev.
+            return
+        }
+        val pLat = prevLat
+        val pLon = prevLon
+        if (pLat != null && pLon != null) {
+            val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+            // Ignore implausible jumps (>1 km between 1-second fixes = >3600 km/h).
+            // These are usually GPS glitches after a cold start or tunnel exit.
+            if (d in 0.0..1000.0) {
+                totalDistanceM += d
+            }
+        }
+        prevLat = pt.lat
+        prevLon = pt.lon
+    }
+
+    /**
+     * Returns the great-circle distance between two lat/lon points in meters.
+     * Uses the Haversine formula.
+     */
+    private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val r = 6_371_000.0 // Earth radius in meters
+        val dLat = Math.toRadians(lat2 - lat1)
+        val dLon = Math.toRadians(lon2 - lon1)
+        val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
+            Math.sin(dLon / 2) * Math.sin(dLon / 2)
+        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+        return r * c
+    }
+
+    /**
+     * Determines the GNSS fix type from the satellite count and fix recency:
+     *  - "no fix" — no recent fix or no satellites used
+     *  - "2D fix" — 1–3 satellites used in fix (lat/lon only)
+     *  - "3D fix" — 4+ satellites used in fix (lat/lon + altitude)
+     *
+     * Falls back to using Location.hasAltitude() if satellite info isn't available.
+     */
+    private fun computeFixType(): String {
+        val now = System.currentTimeMillis()
+        val recentFix = lastFixTimeMs > 0 && (now - lastFixTimeMs) < NO_FIX_TIMEOUT_MS
+        if (!recentFix) return "no fix"
+        if (satellitesUsed == 0) return "no fix"
+        return if (satellitesUsed >= 4) "3D fix" else "2D fix"
     }
 
     /**
@@ -441,6 +594,9 @@ class GpsRecorderService : Service(), LocationListener {
             prefs.putBoolean(KEY_IS_RECORDING, isRecording)
             prefs.putLong(KEY_START_TIME, startTimeMs)
             prefs.putInt(KEY_POINT_COUNT, pointCount)
+            prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
+            prefs.putString(KEY_FIX_TYPE, computeFixType())
+            prefs.putInt(KEY_SATELLITES_USED, satellitesUsed)
             val fix = lastFix ?: synchronized(pointBufferLock) { pointBuffer.lastOrNull() }
             if (fix != null) {
                 prefs.putString(KEY_LAST_LAT, fix.lat.toString())
@@ -495,6 +651,7 @@ class GpsRecorderService : Service(), LocationListener {
 
     private fun cleanupGpsAndWakeLock() {
         stopLocationUpdates()
+        stopGnssStatusTracking()
         releaseWakeLock()
         handler.removeCallbacks(durationTick)
         handler.removeCallbacks(flushTick)
@@ -701,6 +858,7 @@ class GpsRecorderService : Service(), LocationListener {
         prefs.putLong(KEY_START_TIME, startTimeMs)
         prefs.putInt(KEY_POINT_COUNT, pointCount)
         prefs.putString(KEY_TEMP_FILE_NAME, tempFileName)
+        prefs.putString(KEY_TOTAL_DISTANCE, totalDistanceM.toString())
         prefs.apply()
     }
 
@@ -717,9 +875,19 @@ class GpsRecorderService : Service(), LocationListener {
             startTimeMs = prefs.getLong(KEY_START_TIME, System.currentTimeMillis())
             pointCount = prefs.getInt(KEY_POINT_COUNT, 0)
             tempFileName = prefs.getString(KEY_TEMP_FILE_NAME, null)
-            Log.i(TAG, "Recovered recording state: start=$startTimeMs count=$pointCount temp=$tempFileName")
+            totalDistanceM = prefs.getString(KEY_TOTAL_DISTANCE, "0")?.toDoubleOrNull() ?: 0.0
+            Log.i(TAG, "Recovered recording state: start=$startTimeMs count=$pointCount temp=$tempFileName dist=$totalDistanceM")
             // Try to reload buffered points from the temp file
             reloadPointsFromTempFile()
+            // Restore prevLat/prevLon from the last buffered point so distance
+            // accumulation continues smoothly after a service restart.
+            synchronized(pointBufferLock) {
+                pointBuffer.lastOrNull()?.let { last ->
+                    prevLat = last.lat
+                    prevLon = last.lon
+                    lastFixTimeMs = last.timeMs
+                }
+            }
         }
     }
 
