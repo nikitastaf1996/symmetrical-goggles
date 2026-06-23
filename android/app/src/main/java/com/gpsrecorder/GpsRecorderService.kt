@@ -97,6 +97,17 @@ class GpsRecorderService : Service(), LocationListener {
         // Minimum number of points that must exist before distance starts accumulating,
         // so a single noisy first fix doesn't shift the total by a large jump.
         private const val ACCURACY_THRESHOLD_M = 50.0f  // ignore fixes worse than this
+
+        // Maximum acceptable age of a GPS fix (ms). Fixes older than this are dropped
+        // in onLocationChanged to prevent stale cached fixes from inflating the
+        // distance of a fresh recording. See "starts with 9 m / 69 m" bug fix.
+        private const val MAX_FIX_AGE_MS = 3000L
+
+        // ---- Post-processing algorithm thresholds ----
+        // (kept as constants so they're easy to tune; documented in postProcessGpx)
+        private const val POST_PROCESS_ACCURACY_THRESHOLD_M = 15.0f
+        private const val POST_PROCESS_JUMP_THRESHOLD_M = 15.0
+        private const val POST_PROCESS_GAP_THRESHOLD_S = 5.0
     }
 
     private var locationManager: LocationManager? = null
@@ -213,13 +224,25 @@ class GpsRecorderService : Service(), LocationListener {
     // ------------------------------------------------------------------
 
     private fun startRecording(resume: Boolean = false) {
-        if (isRecording) {
-            Log.i(TAG, "Already recording, ignoring start")
-            // Still make sure we are in foreground (e.g. after system restart)
-            startForegroundIfNeeded()
-            return
-        }
-        if (!resume) {
+        if (resume) {
+            // System restarted the service (START_STICKY). Only resume if we genuinely
+            // were recording; otherwise there is nothing to resume.
+            if (!isRecording) {
+                Log.i(TAG, "System restarted service but we weren't recording — stopping")
+                stopSelf()
+                return
+            }
+            Log.i(TAG, "Resuming recording after system restart")
+            // Do NOT reset state — continue from where we left off.
+        } else {
+            // The user explicitly pressed START. Always start a fresh recording,
+            // even if isRecording happens to be true (e.g. leftover state from a
+            // previous session that was killed before stopRecording() could clear
+            // SharedPreferences). Without this, totalDistanceM from the previous
+            // session would leak into the new one — the "starts with 69 m" bug.
+            if (isRecording) {
+                Log.w(TAG, "User pressed START while isRecording=true (leftover state) — resetting")
+            }
             startTimeMs = System.currentTimeMillis()
             pointCount = 0
             totalDistanceM = 0.0
@@ -423,16 +446,25 @@ class GpsRecorderService : Service(), LocationListener {
             }
         }
 
-        // Try to get an immediate last known location so the user sees something quickly
-        try {
-            val last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-            if (last != null) {
-                onLocationChanged(last)
-            }
-        } catch (e: SecurityException) {
-            Log.w(TAG, "Cannot get last known location", e)
-        }
+        // NOTE: We deliberately do NOT seed from lm.getLastKnownLocation() here.
+        //
+        // The previous version did:
+        //     val last = lm.getLastKnownLocation(GPS_PROVIDER) ?: getLastKnownLocation(NETWORK_PROVIDER)
+        //     if (last != null) onLocationChanged(last)
+        //
+        // That call returns whatever fix the OS happens to have cached, which is
+        // frequently STALE — e.g. a fix from 30+ seconds ago when the user was a
+        // few meters away from where they are now. That stale fix would be added
+        // to pointBuffer and become prevLat/prevLon with no distance added (prev
+        // was null). When the first FRESH fix arrived a moment later, the
+        // Haversine distance from the stale prev to the fresh fix would be added
+        // to totalDistanceM — producing the "starts with 9 m / 69 m" bug the user
+        // reported.
+        //
+        // The always-on GNSS monitor in GpsRecorderModule already seeds the UI
+        // with fix status as soon as the app opens, so removing this seed does
+        // not degrade UX. The service simply waits for the first real fix from
+        // requestLocationUpdates() above, which is guaranteed to be fresh.
     }
 
     private fun stopLocationUpdates() {
@@ -508,6 +540,17 @@ class GpsRecorderService : Service(), LocationListener {
             accuracy = if (location.hasAccuracy()) location.accuracy else null,
             timeMs = if (location.time > 0) location.time else System.currentTimeMillis()
         )
+        // Defensive: drop fixes whose timestamp is more than MAX_FIX_AGE_MS in the
+        // past. The OS occasionally delivers a slightly stale fix immediately after
+        // requestLocationUpdates() is called, and such a fix would poison prevLat/
+        // prevLon and inflate totalDistanceM on the next fresh fix. This is the
+        // second half of the "starts with 9 m / 69 m" fix (the first half is
+        // removing the explicit getLastKnownLocation() seed above).
+        val fixAgeMs = System.currentTimeMillis() - pt.timeMs
+        if (fixAgeMs > MAX_FIX_AGE_MS) {
+            Log.w(TAG, "Dropping stale fix: age=${fixAgeMs}ms lat=${pt.lat} lon=${pt.lon}")
+            return
+        }
         synchronized(pointBufferLock) {
             pointBuffer.add(pt)
             pointCount = pointBuffer.size
@@ -668,6 +711,16 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
+     * Reads the post-process setting from the SEPARATE settings prefs file.
+     * The setting is written by GpsRecorderModule.setPostProcessEnabled() from JS.
+     * Stored apart from `gps_recorder_state` so it survives the per-recording clear.
+     */
+    private fun isPostProcessEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean("post_process_enabled", false)
+    }
+
+    /**
      * Writes the GPX header to the temp file, replacing any previous content.
      * The temp file lives in the app's cache dir so it survives the JS app being killed
      * but is private to the app.
@@ -712,6 +765,12 @@ class GpsRecorderService : Service(), LocationListener {
      * Finalizes the GPX file: writes a complete GPX file (header + all points + footer)
      * and saves it to the public Downloads folder.
      *
+     * If the post-process setting is enabled, the raw file is then read back, the
+     * post-processing algorithm (parse / sort / dedupe / accuracy filter / jump
+     * sweep / 1 Hz interpolation) is applied, and the file is OVERWRITTEN with the
+     * processed content. If the setting is disabled, only the raw data is written
+     * (the original behavior).
+     *
      * On API >= 29 we use MediaStore.Downloads so the file is visible to other apps.
      * On older APIs we write directly to Environment.DIRECTORY_DOWNLOADS.
      *
@@ -726,7 +785,7 @@ class GpsRecorderService : Service(), LocationListener {
             .format(Date(startTimeMs))
         val fileName = "trck_$timestamp.gpx"
 
-        val gpxContent = buildString {
+        val rawGpxContent = buildString {
             append(gpxHeader())
             append("  <trk>\n")
             append("    <name>GPS Recording $timestamp</name>\n")
@@ -739,20 +798,22 @@ class GpsRecorderService : Service(), LocationListener {
             append("</gpx>\n")
         }
 
-        val bytes = gpxContent.toByteArray(Charsets.UTF_8)
+        val rawBytes = rawGpxContent.toByteArray(Charsets.UTF_8)
+        val postProcess = isPostProcessEnabled()
+        Log.i(TAG, "finalizeGpxFile: points=${snapshot.size} postProcess=$postProcess")
 
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(fileName, bytes)
+                saveViaMediaStore(fileName, rawBytes, postProcess)
             } else {
-                saveViaLegacyFile(fileName, bytes)
+                saveViaLegacyFile(fileName, rawBytes, postProcess)
             }
         } catch (e: Exception) {
             Log.e(TAG, "finalizeGpxFile failed; falling back to cache", e)
-            // Last resort: write to cache and return its path
+            // Last resort: write to cache and return its path (raw only, no post-process)
             try {
                 val f = File(externalCacheDir ?: cacheDir, fileName)
-                FileOutputStream(f).use { it.write(bytes) }
+                FileOutputStream(f).use { it.write(rawBytes) }
                 "Cache fallback: ${f.absolutePath}"
             } catch (e2: Exception) {
                 Log.e(TAG, "Even cache fallback failed", e2)
@@ -764,7 +825,7 @@ class GpsRecorderService : Service(), LocationListener {
         }
     }
 
-    private fun saveViaMediaStore(fileName: String, bytes: ByteArray): String {
+    private fun saveViaMediaStore(fileName: String, rawBytes: ByteArray, postProcess: Boolean): String {
         val resolver = contentResolver
         val values = android.content.ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
@@ -782,26 +843,237 @@ class GpsRecorderService : Service(), LocationListener {
         }
         val uri = resolver.insert(collection, values)
             ?: throw java.io.IOException("MediaStore insert returned null")
-        resolver.openOutputStream(uri)?.use { out: OutputStream ->
-            out.write(bytes)
-            out.flush()
-        } ?: throw java.io.IOException("Cannot open output stream for $uri")
-        // Mark as not pending so it becomes visible
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val done = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
-            resolver.update(uri, done, null, null)
+        try {
+            // Step 1: write the RAW data to the file.
+            resolver.openOutputStream(uri)?.use { out: OutputStream ->
+                out.write(rawBytes)
+                out.flush()
+            } ?: throw java.io.IOException("Cannot open output stream for $uri")
+
+            // Step 2: if post-processing is enabled, read the raw file back, apply
+            // the algorithm, and OVERWRITE the file with the processed content.
+            if (postProcess) {
+                val rawText = resolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?.toString(Charsets.UTF_8) ?: ""
+                val processedText = try {
+                    postProcessGpx(rawText)
+                } catch (e: Exception) {
+                    Log.e(TAG, "postProcessGpx failed; keeping raw file", e)
+                    rawText
+                }
+                val processedBytes = processedText.toByteArray(Charsets.UTF_8)
+                // "wt" = write-truncate: replaces the file's contents.
+                resolver.openOutputStream(uri, "wt")?.use { out: OutputStream ->
+                    out.write(processedBytes)
+                    out.flush()
+                } ?: throw java.io.IOException("Cannot reopen output stream for $uri (post-process)")
+                Log.i(TAG, "Post-processed GPX written (${processedBytes.size} bytes)")
+            }
+        } finally {
+            // Mark as not pending so it becomes visible, regardless of whether
+            // post-processing succeeded (we always want the file accessible).
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val done = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                resolver.update(uri, done, null, null)
+            }
         }
         return "Downloads/trck/$fileName"
     }
 
-    private fun saveViaLegacyFile(fileName: String, bytes: ByteArray): String {
+    private fun saveViaLegacyFile(fileName: String, rawBytes: ByteArray, postProcess: Boolean): String {
         @Suppress("DEPRECATION")
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         val targetDir = File(downloadsDir, "trck").apply { if (!exists()) mkdirs() }
         val f = File(targetDir, fileName)
-        FileOutputStream(f).use { it.write(bytes) }
+        // Step 1: write raw bytes.
+        FileOutputStream(f).use { it.write(rawBytes) }
+        // Step 2: if post-processing is enabled, read back, process, overwrite.
+        if (postProcess) {
+            val rawText = f.readText(Charsets.UTF_8)
+            val processedText = try {
+                postProcessGpx(rawText)
+            } catch (e: Exception) {
+                Log.e(TAG, "postProcessGpx failed; keeping raw file", e)
+                rawText
+            }
+            FileOutputStream(f).use { it.write(processedText.toByteArray(Charsets.UTF_8)) }
+            Log.i(TAG, "Post-processed GPX written to ${f.absolutePath}")
+        }
         return f.absolutePath
     }
+
+    // ------------------------------------------------------------------
+    // Post-processing algorithm
+    // ------------------------------------------------------------------
+
+    /**
+     * Post-processes the raw GPX content. Implements the user-specified algorithm:
+     *
+     *   1. Parse all trkpt (lat/lon/ele/time/speed/accuracy).
+     *   2. Sort by timestamp ascending (stable).
+     *   3. Drop points with accuracy missing or >= 15.0 m.
+     *   4. Drop duplicate-timestamp points (dt == 0).
+     *   5. Defensive jump sweep: drop points still producing >= 15.0 m jump vs
+     *      previous kept.
+     *   6. Interpolate remaining outages (gaps >= 5.0 s) at 1.0 Hz. Synthetic
+     *      points are tagged <interpolated>true</interpolated> in <extensions>.
+     *
+     * If the input has no parseable trkpt, it is returned unchanged so the user
+     * still gets a (raw) file rather than nothing.
+     */
+    private fun postProcessGpx(rawGpx: String): String {
+        // 1. Parse all trkpt
+        val parsed = mutableListOf<GpxTrkPt>()
+        val regex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
+        for (m in regex.findAll(rawGpx)) {
+            val lat = m.groupValues[1].toDoubleOrNull() ?: continue
+            val lon = m.groupValues[2].toDoubleOrNull() ?: continue
+            val inner = m.groupValues[3]
+            val ele = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
+            val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+            val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+            val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
+            val timeMs = parseIsoTime(timeIso) ?: continue
+            parsed.add(GpxTrkPt(lat, lon, ele, speed, acc, timeMs, interpolated = false))
+        }
+        if (parsed.isEmpty()) {
+            Log.w(TAG, "postProcessGpx: no trkpt found, returning raw input")
+            return rawGpx
+        }
+        Log.i(TAG, "postProcessGpx: parsed ${parsed.size} points")
+
+        // 2. Sort by timestamp ascending (stable — Kotlin's sortedBy is stable).
+        val sorted = parsed.sortedBy { it.timeMs }
+
+        // 3. Drop points with accuracy missing or >= 15.0 m.
+        val filteredAcc = sorted.filter { p ->
+            val a = p.accuracy
+            a != null && a < POST_PROCESS_ACCURACY_THRESHOLD_M
+        }
+        Log.i(TAG, "postProcessGpx: after accuracy filter -> ${filteredAcc.size}")
+
+        // 4. Drop duplicate-timestamp points (dt == 0).
+        val filteredDup = ArrayList<GpxTrkPt>(filteredAcc.size)
+        var lastT = Long.MIN_VALUE
+        for (p in filteredAcc) {
+            if (p.timeMs != lastT) {
+                filteredDup.add(p)
+                lastT = p.timeMs
+            }
+        }
+        Log.i(TAG, "postProcessGpx: after duplicate-timestamp filter -> ${filteredDup.size}")
+
+        // 5. Defensive jump sweep: drop points still producing >= 15.0 m jump vs
+        //    previous kept. (We use a fresh threshold constant so this stays
+        //    decoupled from the recording-time ACCURACY_THRESHOLD_M.)
+        val filteredJump = ArrayList<GpxTrkPt>(filteredDup.size)
+        for (p in filteredDup) {
+            val prev = filteredJump.lastOrNull()
+            if (prev == null) {
+                filteredJump.add(p)
+            } else {
+                val d = haversineMeters(prev.lat, prev.lon, p.lat, p.lon)
+                if (d < POST_PROCESS_JUMP_THRESHOLD_M) {
+                    filteredJump.add(p)
+                }
+                // else: drop (>= 15 m jump from previous kept)
+            }
+        }
+        Log.i(TAG, "postProcessGpx: after jump sweep -> ${filteredJump.size}")
+
+        // 6. Interpolate remaining outages (gaps >= 5.0 s) at 1.0 Hz.
+        //    Synthetic points are tagged <interpolated>true</interpolated>.
+        val final = ArrayList<GpxTrkPt>(filteredJump.size * 2)
+        if (filteredJump.isNotEmpty()) {
+            final.add(filteredJump[0])
+            for (i in 1 until filteredJump.size) {
+                val prev = filteredJump[i - 1]
+                val curr = filteredJump[i]
+                val dtMs = curr.timeMs - prev.timeMs
+                val dtSec = dtMs / 1000.0
+                if (dtSec >= POST_PROCESS_GAP_THRESHOLD_S) {
+                    // Add a synthetic point at every whole second strictly between
+                    // prev and curr. E.g. dt = 7.0s -> k = 1..6 (6 points).
+                    var k = 1
+                    while (true) {
+                        val tSyn = prev.timeMs + k * 1000L
+                        if (tSyn >= curr.timeMs) break
+                        val frac = (tSyn - prev.timeMs).toDouble() / dtMs.toDouble()
+                        val lat = prev.lat + (curr.lat - prev.lat) * frac
+                        val lon = prev.lon + (curr.lon - prev.lon) * frac
+                        val ele = if (prev.ele != null && curr.ele != null)
+                            prev.ele + (curr.ele - prev.ele) * frac else null
+                        val speed = if (prev.speed != null && curr.speed != null)
+                            (prev.speed + (curr.speed - prev.speed) * frac).toFloat() else null
+                        final.add(GpxTrkPt(lat, lon, ele, speed, null, tSyn, interpolated = true))
+                        k++
+                    }
+                }
+                final.add(curr)
+            }
+        }
+        Log.i(TAG, "postProcessGpx: after interpolation -> ${final.size} points")
+
+        // Rebuild GPX. Preserve the original <name> if present, else use a default.
+        val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
+            ?: "GPS Recording"
+        return buildString {
+            append(gpxHeader())
+            append("  <trk>\n")
+            append("    <name>").append(origName).append("</name>\n")
+            append("    <trkseg>\n")
+            for (p in final) {
+                append(formatGpxPointWithInterpolated(p))
+            }
+            append("    </trkseg>\n")
+            append("  </trk>\n")
+            append("</gpx>\n")
+        }
+    }
+
+    /**
+     * Like [formatGpxPoint] but also emits an <interpolated>true</interpolated>
+     * tag inside <extensions> when [p.interpolated] is true. Synthetic points
+     * have no accuracy, so we always emit <extensions> for them.
+     */
+    private fun formatGpxPointWithInterpolated(p: GpxTrkPt): String {
+        val sb = StringBuilder()
+        sb.append("      <trkpt lat=\"").append(p.lat).append("\" lon=\"").append(p.lon).append("\">\n")
+        if (p.ele != null) {
+            sb.append("        <ele>").append(p.ele).append("</ele>\n")
+        }
+        sb.append("        <time>").append(isoTime(p.timeMs)).append("</time>\n")
+        if (p.speed != null) {
+            sb.append("        <speed>").append(p.speed).append("</speed>\n")
+        }
+        if (p.accuracy != null || p.interpolated) {
+            sb.append("        <extensions>\n")
+            if (p.accuracy != null) {
+                sb.append("          <accuracy>").append(p.accuracy).append("</accuracy>\n")
+            }
+            if (p.interpolated) {
+                sb.append("          <interpolated>true</interpolated>\n")
+            }
+            sb.append("        </extensions>\n")
+        }
+        sb.append("      </trkpt>\n")
+        return sb.toString()
+    }
+
+    /**
+     * Lightweight trkpt representation used by the post-processing pipeline.
+     * Carries an [interpolated] flag so synthetic points can be tagged in the
+     * output GPX.
+     */
+    private data class GpxTrkPt(
+        val lat: Double,
+        val lon: Double,
+        val ele: Double?,
+        val speed: Float?,
+        val accuracy: Float?,
+        val timeMs: Long,
+        val interpolated: Boolean = false
+    )
 
     // ------------------------------------------------------------------
     // GPX formatting helpers

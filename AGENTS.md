@@ -213,3 +213,59 @@ The design that achieves this:
 
 If you change the service code, please re-read the above and make sure you
 don't regress any of these properties.
+
+## Post-processing setting
+
+There is a user-facing toggle in the app: **"Постобработка GPX"** (GPX
+post-processing). When enabled, after the raw GPX file is written to
+`Downloads/trck/`, the service reads it back, applies the post-processing
+algorithm, and overwrites the file. When disabled, only raw data is written
+(the original behavior).
+
+The setting is persisted in a **separate** SharedPreferences file
+(`gps_recorder_settings`) so it survives the per-recording state clear in
+`stopRecording()`. JS reads/writes it via `GpsRecorder.getPostProcessEnabled()`
+and `GpsRecorder.setPostProcessEnabled(bool)`.
+
+The algorithm (in `GpsRecorderService.postProcessGpx()`):
+
+1. Parse all `<trkpt>` (lat/lon/ele/time/speed/accuracy).
+2. Sort by timestamp ascending (stable).
+3. Drop points with accuracy missing or `>= 15.0` m.
+4. Drop duplicate-timestamp points (`dt == 0`).
+5. Defensive jump sweep: drop points still producing `>= 15.0` m jump vs
+   previous kept.
+6. Interpolate remaining outages (gaps `>= 5.0` s) at 1.0 Hz. Synthetic points
+   are tagged `<interpolated>true</interpolated>` inside `<extensions>`.
+
+A standalone Python reference implementation with tests lives at
+`/home/z/my-project/scripts/test_post_process.py` in the build agent's
+environment (not committed to the repo).
+
+## Distance-leakage fix
+
+Previous versions had a bug where pressing START sometimes showed a non-zero
+distance (e.g. 9 m or 69 m) immediately. Two root causes, both fixed:
+
+1. **Stale `getLastKnownLocation()` seed.** `startLocationUpdates()` used to
+   call `lm.getLastKnownLocation(...)` and feed the result to
+   `onLocationChanged()`. That cached fix was frequently stale (e.g. a fix
+   from 30 s ago when the user was a few meters away). It became `prevLat`/
+   `prevLon` with no distance added (prev was null), but the *next* fresh fix
+   then had its Haversine distance to that stale point added — producing the
+   spurious initial distance. **Fix:** removed the `getLastKnownLocation()`
+   seed entirely. The always-on GNSS monitor already seeds the UI; the service
+   just waits for the first real fix from `requestLocationUpdates()`.
+2. **Defensive fix-age guard.** Even without the explicit seed, the OS can
+   occasionally deliver a slightly stale fix immediately after
+   `requestLocationUpdates()`. `onLocationChanged()` now drops any fix older
+   than `MAX_FIX_AGE_MS` (3 s) before it can touch the buffer or the distance
+   accumulator.
+3. **Leftover `isRecording=true` state.** If a previous recording was killed
+   (e.g. user force-stopped the app) before `stopRecording()` could clear
+   `SharedPreferences`, the next app launch would recover `isRecording=true`
+   and the old `totalDistanceM`. Pressing START would then hit the "already
+   recording, ignoring start" early-return and never reset the distance.
+   **Fix:** `startRecording(resume=false)` now ALWAYS resets state and starts
+   fresh, even if `isRecording` happens to be true. Only `resume=true`
+   (system-initiated restart via `START_STICKY`) skips the reset.

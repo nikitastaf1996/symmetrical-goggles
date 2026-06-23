@@ -369,6 +369,38 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         promise.resolve(prefs.getBoolean("is_recording", false))
     }
 
+    // ---- Post-processing setting ----
+    //
+    // Persisted in a SEPARATE SharedPreferences file ("gps_recorder_settings") so it
+    // survives the recording-state clear that happens on stopRecording(). When enabled,
+    // GpsRecorderService.finalizeGpxFile() will, after writing the raw GPX file, read
+    // it back, apply the post-processing algorithm (sort/dedupe/jump-sweep/interpolate),
+    // and overwrite the file with the processed content. When disabled, only raw data
+    // is written (the original behavior).
+
+    private fun settingsPrefs() =
+        reactContext.getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+
+    @ReactMethod
+    fun setPostProcessEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("post_process_enabled", enabled).apply()
+            Log.i(TAG, "Post-process enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setPostProcessEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getPostProcessEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("post_process_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getPostProcessEnabled error", e)
+        }
+    }
+
     /**
      * Returns the current recording state, point count, elapsed time, last GPS fix,
      * total distance traveled, and current GNSS fix type. JS calls this on mount and

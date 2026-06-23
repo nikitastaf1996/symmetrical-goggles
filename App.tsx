@@ -145,6 +145,7 @@ function App(): React.ReactElement {
   const [lastSavedPath, setLastSavedPath] = useState<string | null>(null);
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false);
   const startTimeRef = useRef<number | null>(null);
 
   // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
@@ -186,6 +187,12 @@ function App(): React.ReactElement {
         }
         if (!mounted) return;
         setHasPermissions(granted);
+
+        // Load the post-process setting from native prefs.
+        try {
+          const pp = await GpsRecorder.getPostProcessEnabled();
+          if (mounted) setPostProcessEnabled(pp);
+        } catch { /* ignore */ }
 
         // Start the always-on GNSS monitor so the UI shows fix status even
         // before recording starts.
@@ -359,6 +366,19 @@ function App(): React.ReactElement {
     }
   }, []);
 
+  const handleTogglePostProcess = useCallback(async () => {
+    const next = !postProcessEnabled;
+    setPostProcessEnabled(next); // optimistic UI update
+    try {
+      const confirmed = await GpsRecorder.setPostProcessEnabled(next);
+      setPostProcessEnabled(confirmed);
+    } catch (e: any) {
+      // revert on failure
+      setPostProcessEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [postProcessEnabled]);
+
   const isRecording = recordingState === 'recording';
   const isStopping = recordingState === 'stopping';
 
@@ -435,6 +455,37 @@ function App(): React.ReactElement {
             </Text>
           </Pressable>
         </View>
+
+        {/* Post-processing toggle */}
+        <Pressable
+          style={[
+            styles.toggleRow,
+            postProcessEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+          ]}
+          onPress={handleTogglePostProcess}
+        >
+          <View style={styles.toggleLabelWrap}>
+            <Text style={styles.toggleTitle}>Постобработка GPX</Text>
+            <Text style={styles.toggleSubtitle}>
+              {postProcessEnabled
+                ? 'Фильтр точности, дедупликация, интерполяция 1 Гц'
+                : 'Только сырые данные (без обработки)'}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.toggleSwitch,
+              postProcessEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+            ]}
+          >
+            <View
+              style={[
+                styles.toggleKnob,
+                postProcessEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+              ]}
+            />
+          </View>
+        </Pressable>
 
         {!hasPermissions && (
           <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
@@ -657,6 +708,57 @@ const styles = StyleSheet.create({
   bigButtonText: {
     color: '#FFFFFF', fontSize: 32, fontWeight: '800', letterSpacing: 4,
   },
+  // ---- Post-processing toggle ----
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 16,
+  },
+  toggleRowOn: {
+    backgroundColor: '#EFF6FF',
+    borderColor: '#BFDBFE',
+  },
+  toggleRowOff: {
+    backgroundColor: '#F9FAFB',
+    borderColor: COLOR.divider,
+  },
+  toggleLabelWrap: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  toggleTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLOR.primary,
+    marginBottom: 2,
+  },
+  toggleSubtitle: {
+    fontSize: 11,
+    color: COLOR.secondary,
+    lineHeight: 15,
+  },
+  toggleSwitch: {
+    width: 44,
+    height: 24,
+    borderRadius: 12,
+    padding: 2,
+    justifyContent: 'center',
+  },
+  toggleSwitchOn: { backgroundColor: COLOR.accentStart },
+  toggleSwitchOff: { backgroundColor: '#D1D5DB' },
+  toggleKnob: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+  },
+  toggleKnobOn: { alignSelf: 'flex-end' },
+  toggleKnobOff: { alignSelf: 'flex-start' },
   // ---- Permission button ----
   permissionButton: {
     backgroundColor: '#F3F4F6', borderRadius: 12, paddingVertical: 14,

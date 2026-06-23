@@ -87,6 +87,8 @@ type GpsRecorderNativeType = {
   openAppSettings(): Promise<void>;
   startGnssMonitor(): Promise<boolean>;
   stopGnssMonitor(): Promise<boolean>;
+  setPostProcessEnabled(enabled: boolean): Promise<boolean>;
+  getPostProcessEnabled(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -109,6 +111,8 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   openAppSettings: async () => {},
   startGnssMonitor: async () => false,
   stopGnssMonitor: async () => false,
+  setPostProcessEnabled: async (_enabled: boolean) => false,
+  getPostProcessEnabled: async () => false,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -124,6 +128,8 @@ export const GpsRecorder = {
   openAppSettings: () => NativeGpsRecorder.openAppSettings(),
   startGnssMonitor: () => NativeGpsRecorder.startGnssMonitor(),
   stopGnssMonitor: () => NativeGpsRecorder.stopGnssMonitor(),
+  setPostProcessEnabled: (enabled: boolean) => NativeGpsRecorder.setPostProcessEnabled(enabled),
+  getPostProcessEnabled: () => NativeGpsRecorder.getPostProcessEnabled(),
 };
 
 /**
