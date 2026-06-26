@@ -42,6 +42,8 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  *   - getGaussianSmoothingEnabled() -> Promise<Boolean>
  *   - setAutoPauseEnabled(b)       -> Promise<Boolean> (auto-pause on stop detection)
  *   - getAutoPauseEnabled()        -> Promise<Boolean>
+ *   - setGapDetectionEnabled(b)    -> Promise<Boolean> (gap detection on signal loss)
+ *   - getGapDetectionEnabled()     -> Promise<Boolean>
  *   - startGnssMonitor()           -> Promise<Boolean> (always-on GNSS status)
  *   - stopGnssMonitor()            -> Promise<Boolean>
  *   - addListener(String)          -> required by NativeEventEmitter
@@ -487,6 +489,42 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(settingsPrefs().getBoolean("auto_pause_enabled", false))
         } catch (e: Exception) {
             promise.reject("E_SETTINGS", e.message ?: "getAutoPauseEnabled error", e)
+        }
+    }
+
+    // ---- Gap-detection setting (Phase 4 toggle) ----
+    //
+    // Persisted in the same SEPARATE SharedPreferences file
+    // ("gps_recorder_settings") as the other toggles, so it survives the
+    // per-recording state clear. When enabled (DEFAULT — preserves the
+    // behaviour shipped in the previous APK), the gap watchdog in
+    // GpsRecorderService.flushTick declares signalLost after
+    // GAP_THRESHOLD_MS (15 s) without a fix, and the next arriving fix
+    // triggers a segment split so the track has clean <trkseg> breaks at
+    // signal outages. When disabled, gaps are NOT detected: the timer
+    // keeps running across the outage, the next fix is appended to the
+    // same segment, and the velocity gate will compare it against the
+    // pre-gap point — the legacy pre-Phase-4 behaviour.
+
+    @ReactMethod
+    fun setGapDetectionEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("gap_detection_enabled", enabled).apply()
+            Log.i(TAG, "Gap detection enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setGapDetectionEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getGapDetectionEnabled(promise: Promise) {
+        try {
+            // Default true: the previous APK always ran gap detection, so
+            // existing users get the same behaviour after upgrading.
+            promise.resolve(settingsPrefs().getBoolean("gap_detection_enabled", true))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getGapDetectionEnabled error", e)
         }
     }
 

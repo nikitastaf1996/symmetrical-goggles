@@ -160,6 +160,9 @@ function App(): React.ReactElement {
   const [gaussianSmoothingEnabled, setGaussianSmoothingEnabled] = useState<boolean>(false);
   // Phase 1/3/4: auto-pause setting + live pause / signal state + moving time.
   const [autoPauseEnabled, setAutoPauseEnabled] = useState<boolean>(false);
+  // Phase 4 toggle: gap detection (signal-loss segment splits). Defaults to
+  // true so existing users keep the behaviour from the previous APK.
+  const [gapDetectionEnabled, setGapDetectionEnabled] = useState<boolean>(true);
   const [isAutoPaused, setIsAutoPaused] = useState<boolean>(false);
   const [signalLost, setSignalLost] = useState<boolean>(false);
   const [movingMs, setMovingMs] = useState<number>(0);
@@ -225,6 +228,14 @@ function App(): React.ReactElement {
         try {
           const ap = await GpsRecorder.getAutoPauseEnabled();
           if (mounted) setAutoPauseEnabled(ap);
+        } catch { /* ignore */ }
+
+        // Phase 4: load the gap-detection setting from native prefs.
+        // Default is true (the previous APK always ran gap detection), so if
+        // the native side returns false here it's a real user choice.
+        try {
+          const gd = await GpsRecorder.getGapDetectionEnabled();
+          if (mounted) setGapDetectionEnabled(gd);
         } catch { /* ignore */ }
 
         // Start the always-on GNSS monitor so the UI shows fix status even
@@ -469,6 +480,23 @@ function App(): React.ReactElement {
     }
   }, [autoPauseEnabled, settingsLocked]);
 
+  // Phase 4: toggle the gap-detection setting. Same persistence + lock-
+  // during-recording semantics as the other toggles. Default is on; turning
+  // it off restores the legacy pre-Phase-4 behaviour where signal outages
+  // do NOT split the track and the signal-lost UI banner never appears.
+  const handleToggleGapDetection = useCallback(async () => {
+    if (settingsLocked) return;
+    const next = !gapDetectionEnabled;
+    setGapDetectionEnabled(next);
+    try {
+      const confirmed = await GpsRecorder.setGapDetectionEnabled(next);
+      setGapDetectionEnabled(confirmed);
+    } catch (e: any) {
+      setGapDetectionEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [gapDetectionEnabled, settingsLocked]);
+
   const distanceFmt = formatDistance(distance);
   const currentPace = computeCurrentPace(currentSpeed);
   // Phase 6: when auto-pause is enabled, compute average pace using the
@@ -707,6 +735,46 @@ function App(): React.ReactElement {
               style={[
                 styles.toggleKnob,
                 autoPauseEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+              ]}
+            />
+          </View>
+        </Pressable>
+
+        {/* Phase 4: Gap-detection toggle (locked while recording). When
+            enabled (DEFAULT), a watchdog in the service declares signal
+            lost after 15 s without a fix, the UI shows a red "ПОТЕРЯ СИГНАЛА
+            GPS" banner, and the next arriving fix starts a new <trkseg> so
+            the track has a clean break at the outage. When disabled, signal
+            outages do NOT split the track and the banner never appears —
+            the legacy pre-Phase-4 behaviour. */}
+        <Pressable
+          style={[
+            styles.toggleRow,
+            gapDetectionEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+            settingsLocked && styles.toggleRowLocked,
+          ]}
+          onPress={handleToggleGapDetection}
+          disabled={settingsLocked}
+        >
+          <View style={styles.toggleLabelWrap}>
+            <Text style={styles.toggleTitle}>Разделение трека при потере сигнала</Text>
+            <Text style={styles.toggleSubtitle}>
+              {gapDetectionEnabled
+                ? 'Включено: нет фиксации > 15 с → новый сегмент <trkseg> и баннер "ПОТЕРЯ СИГНАЛА". Расстояние через разрыв не считается'
+                : 'Выключено: провалы сигнала игнорируются, трек пишётся одним сегментом (как в прежних версиях)'}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.toggleSwitch,
+              gapDetectionEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              settingsLocked && styles.toggleSwitchLocked,
+            ]}
+          >
+            <View
+              style={[
+                styles.toggleKnob,
+                gapDetectionEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
               ]}
             />
           </View>

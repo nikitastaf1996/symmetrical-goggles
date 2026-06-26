@@ -79,12 +79,14 @@ class GpsRecorderService : Service(), LocationListener {
         private const val KEY_SATELLITES_USED = "satellites_used"
 
         // ---- Auto-pause / gap-detection prefs (Phase 1) ----
-        // KEY_AUTO_PAUSE_ENABLED lives in the SEPARATE settings prefs file
-        // ("gps_recorder_settings") so it survives the per-recording state
-        // clear in stopRecording(). KEY_IS_AUTO_PAUSED / KEY_SIGNAL_LOST /
-        // KEY_MOVING_MS live in PREFS_NAME because they are per-recording
-        // live state, just like KEY_IS_RECORDING.
+        // KEY_AUTO_PAUSE_ENABLED / KEY_GAP_DETECTION_ENABLED live in the
+        // SEPARATE settings prefs file ("gps_recorder_settings") so they
+        // survive the per-recording state clear in stopRecording().
+        // KEY_IS_AUTO_PAUSED / KEY_SIGNAL_LOST / KEY_MOVING_MS live in
+        // PREFS_NAME because they are per-recording live state, just like
+        // KEY_IS_RECORDING.
         private const val KEY_AUTO_PAUSE_ENABLED = "auto_pause_enabled"
+        private const val KEY_GAP_DETECTION_ENABLED = "gap_detection_enabled"
         private const val KEY_IS_AUTO_PAUSED = "is_auto_paused"
         private const val KEY_SIGNAL_LOST = "signal_lost"
         private const val KEY_MOVING_MS = "moving_ms"
@@ -254,7 +256,13 @@ class GpsRecorderService : Service(), LocationListener {
                 // Gap watchdog (Phase 4): if no fix in GAP_THRESHOLD_MS,
                 // declare signal lost so the UI can show a warning and
                 // so the next arriving fix triggers a segment split.
-                if (!signalLost && lastFixTimeMs > 0L) {
+                //
+                // Gated on the gap_detection_enabled setting: when the user
+                // has disabled gap detection we never declare signalLost
+                // (and the segment-split path in onLocationChanged is also
+                // bypassed, so the track stays as one continuous segment
+                // even across outages — the legacy pre-Phase-4 behaviour).
+                if (isGapDetectionEnabled() && !signalLost && lastFixTimeMs > 0L) {
                     val sinceLast = System.currentTimeMillis() - lastFixTimeMs
                     if (sinceLast > GAP_THRESHOLD_MS) {
                         signalLost = true
@@ -810,6 +818,26 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
+     * Reads the gap-detection setting from the SEPARATE settings prefs file.
+     * When enabled (default), the gap watchdog in [flushTick] declares
+     * signalLost after GAP_THRESHOLD_MS without a fix, and the next arriving
+     * fix triggers a segment split so the track has clean <trkseg> breaks at
+     * signal outages. When disabled, gaps are NOT detected: the timer keeps
+     * running across the outage, the next fix is appended to the same
+     * segment, and the velocity gate will compare it against the pre-gap
+     * point (which may produce a velocity outlier that gets dropped, or a
+     * straight-line jump that gets added to totalDistanceM — the legacy
+     * behaviour before gap detection existed).
+     *
+     * The setting is written by GpsRecorderModule.setGapDetectionEnabled()
+     * from JS and survives the per-recording state clear.
+     */
+    private fun isGapDetectionEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean(KEY_GAP_DETECTION_ENABLED, true)
+    }
+
+    /**
      * Persists the auto-pause / signal-lost / moving-time live state to
      * SharedPreferences so it survives service restarts and can be polled
      * via getState(). Called whenever these flags change (whether or not a
@@ -910,14 +938,35 @@ class GpsRecorderService : Service(), LocationListener {
         // cursor so the velocity gate doesn't compare across the gap. Distance
         // across the gap is NOT added to totalDistanceM (prevLat is null after
         // reset, so both the velocity gate and accumulateDistance skip it).
-        val gapDetected = lastFixTimeMs > 0L && (pt.timeMs - lastFixTimeMs) > GAP_THRESHOLD_MS
-        if (gapDetected || signalLost) {
-            Log.i(
-                TAG,
-                "Gap recovery: gapSinceLast=${if (lastFixTimeMs > 0L) pt.timeMs - lastFixTimeMs else -1}ms" +
-                    " signalLostWas=$signalLost"
-            )
-            handleGapRecovery(pt.timeMs)
+        //
+        // Gated on the gap_detection_enabled setting. When the user has
+        // disabled gap detection, we skip the segment-split entirely (the
+        // next fix is appended to the current segment, and the velocity
+        // gate will compare it against the pre-gap point — the legacy pre-
+        // Phase-4 behaviour). signalLost can only be true at this point if
+        // the watchdog declared it while the setting was on, so even when
+        // the setting has just been toggled off mid-recording we still
+        // honor a previously-declared signalLost by clearing it without
+        // splitting the segment.
+        if (isGapDetectionEnabled()) {
+            val gapDetected = lastFixTimeMs > 0L && (pt.timeMs - lastFixTimeMs) > GAP_THRESHOLD_MS
+            if (gapDetected || signalLost) {
+                Log.i(
+                    TAG,
+                    "Gap recovery: gapSinceLast=${if (lastFixTimeMs > 0L) pt.timeMs - lastFixTimeMs else -1}ms" +
+                        " signalLostWas=$signalLost"
+                )
+                handleGapRecovery(pt.timeMs)
+            }
+        } else if (signalLost) {
+            // Setting was toggled off after the watchdog declared signalLost.
+            // Clear the flag without splitting the segment so the UI banner
+            // dismisses itself, but the track keeps its current segment
+            // structure.
+            signalLost = false
+            persistAutoPauseState()
+            updateNotification()
+            Log.i(TAG, "Gap detection disabled mid-outage — clearing signalLost flag")
         }
 
         // ---- Phase 3: Auto-pause (stop detection) ----

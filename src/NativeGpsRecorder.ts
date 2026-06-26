@@ -113,6 +113,12 @@ type GpsRecorderNativeType = {
   // settings prefs file so it survives the per-recording state clear.
   setAutoPauseEnabled(enabled: boolean): Promise<boolean>;
   getAutoPauseEnabled(): Promise<boolean>;
+  // Phase 4: gap detection (signal loss) toggle. Defaults to true so
+  // existing users keep the behaviour from the previous APK. When off,
+  // signal outages do NOT split the track into a new <trkseg> and the
+  // signal-lost UI banner never appears.
+  setGapDetectionEnabled(enabled: boolean): Promise<boolean>;
+  getGapDetectionEnabled(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -144,6 +150,8 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   getGaussianSmoothingEnabled: async () => false,
   setAutoPauseEnabled: async (_enabled: boolean) => false,
   getAutoPauseEnabled: async () => false,
+  setGapDetectionEnabled: async (_enabled: boolean) => false,
+  getGapDetectionEnabled: async () => true,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -165,6 +173,8 @@ export const GpsRecorder = {
   getGaussianSmoothingEnabled: () => NativeGpsRecorder.getGaussianSmoothingEnabled(),
   setAutoPauseEnabled: (enabled: boolean) => NativeGpsRecorder.setAutoPauseEnabled(enabled),
   getAutoPauseEnabled: () => NativeGpsRecorder.getAutoPauseEnabled(),
+  setGapDetectionEnabled: (enabled: boolean) => NativeGpsRecorder.setGapDetectionEnabled(enabled),
+  getGapDetectionEnabled: () => NativeGpsRecorder.getGapDetectionEnabled(),
 };
 
 /**
