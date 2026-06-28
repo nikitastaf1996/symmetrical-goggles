@@ -113,6 +113,25 @@ type GpsRecorderNativeType = {
   getPostProcessEnabled(): Promise<boolean>;
   setGaussianSmoothingEnabled(enabled: boolean): Promise<boolean>;
   getGaussianSmoothingEnabled(): Promise<boolean>;
+  // On-the-fly radial distance filter: drop any fix whose great-circle
+  // distance to the last KEPT point is < threshold meters. Independent of
+  // the post_process_enabled accuracy/velocity gate.
+  setRadialDistanceFilterEnabled(enabled: boolean): Promise<boolean>;
+  getRadialDistanceFilterEnabled(): Promise<boolean>;
+  setRadialDistanceThresholdM(thresholdM: number): Promise<number>;
+  getRadialDistanceThresholdM(): Promise<number>;
+  // On-the-fly time sampling: keep every N-th fix, drop the rest. Useful
+  // for shrinking file size on long recordings where 1 Hz is overkill.
+  setTimeSamplingEnabled(enabled: boolean): Promise<boolean>;
+  getTimeSamplingEnabled(): Promise<boolean>;
+  setTimeSamplingN(n: number): Promise<number>;
+  getTimeSamplingN(): Promise<number>;
+  // Post-process Douglas-Peucker simplification. Applied AFTER Gaussian
+  // smoothing (if that is also enabled) at finalize time, per <trkseg>.
+  setDouglasPeuckerEnabled(enabled: boolean): Promise<boolean>;
+  getDouglasPeuckerEnabled(): Promise<boolean>;
+  setDouglasPeuckerEpsilonM(epsilonM: number): Promise<number>;
+  getDouglasPeuckerEpsilonM(): Promise<number>;
   // Phase 1: auto-pause (stop detection) toggle. Persisted in the separate
   // settings prefs file so it survives the per-recording state clear.
   setAutoPauseEnabled(enabled: boolean): Promise<boolean>;
@@ -152,6 +171,18 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   getPostProcessEnabled: async () => false,
   setGaussianSmoothingEnabled: async (_enabled: boolean) => false,
   getGaussianSmoothingEnabled: async () => false,
+  setRadialDistanceFilterEnabled: async (_enabled: boolean) => false,
+  getRadialDistanceFilterEnabled: async () => false,
+  setRadialDistanceThresholdM: async (_thresholdM: number) => 5,
+  getRadialDistanceThresholdM: async () => 5,
+  setTimeSamplingEnabled: async (_enabled: boolean) => false,
+  getTimeSamplingEnabled: async () => false,
+  setTimeSamplingN: async (_n: number) => 5,
+  getTimeSamplingN: async () => 5,
+  setDouglasPeuckerEnabled: async (_enabled: boolean) => false,
+  getDouglasPeuckerEnabled: async () => false,
+  setDouglasPeuckerEpsilonM: async (_epsilonM: number) => 5.0,
+  getDouglasPeuckerEpsilonM: async () => 5.0,
   setAutoPauseEnabled: async (_enabled: boolean) => false,
   getAutoPauseEnabled: async () => false,
   setGapDetectionEnabled: async (_enabled: boolean) => false,
@@ -175,6 +206,18 @@ export const GpsRecorder = {
   getPostProcessEnabled: () => NativeGpsRecorder.getPostProcessEnabled(),
   setGaussianSmoothingEnabled: (enabled: boolean) => NativeGpsRecorder.setGaussianSmoothingEnabled(enabled),
   getGaussianSmoothingEnabled: () => NativeGpsRecorder.getGaussianSmoothingEnabled(),
+  setRadialDistanceFilterEnabled: (enabled: boolean) => NativeGpsRecorder.setRadialDistanceFilterEnabled(enabled),
+  getRadialDistanceFilterEnabled: () => NativeGpsRecorder.getRadialDistanceFilterEnabled(),
+  setRadialDistanceThresholdM: (thresholdM: number) => NativeGpsRecorder.setRadialDistanceThresholdM(thresholdM),
+  getRadialDistanceThresholdM: () => NativeGpsRecorder.getRadialDistanceThresholdM(),
+  setTimeSamplingEnabled: (enabled: boolean) => NativeGpsRecorder.setTimeSamplingEnabled(enabled),
+  getTimeSamplingEnabled: () => NativeGpsRecorder.getTimeSamplingEnabled(),
+  setTimeSamplingN: (n: number) => NativeGpsRecorder.setTimeSamplingN(n),
+  getTimeSamplingN: () => NativeGpsRecorder.getTimeSamplingN(),
+  setDouglasPeuckerEnabled: (enabled: boolean) => NativeGpsRecorder.setDouglasPeuckerEnabled(enabled),
+  getDouglasPeuckerEnabled: () => NativeGpsRecorder.getDouglasPeuckerEnabled(),
+  setDouglasPeuckerEpsilonM: (epsilonM: number) => NativeGpsRecorder.setDouglasPeuckerEpsilonM(epsilonM),
+  getDouglasPeuckerEpsilonM: () => NativeGpsRecorder.getDouglasPeuckerEpsilonM(),
   setAutoPauseEnabled: (enabled: boolean) => NativeGpsRecorder.setAutoPauseEnabled(enabled),
   getAutoPauseEnabled: () => NativeGpsRecorder.getAutoPauseEnabled(),
   setGapDetectionEnabled: (enabled: boolean) => NativeGpsRecorder.setGapDetectionEnabled(enabled),

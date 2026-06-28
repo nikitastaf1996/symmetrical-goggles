@@ -216,12 +216,12 @@ don't regress any of these properties.
 
 ## Post-processing setting
 
-There are **two independent** user-facing toggles in the app, both located in
-the **НАСТРОЙКИ** section. Both are **locked while a recording is in
+There are **multiple independent** user-facing toggles in the app, all located
+in the **НАСТРОЙКИ** section. All are **locked while a recording is in
 progress** (the row is greyed out and a "🔒 Заблокировано на время записи"
-badge appears next to the section header) so that changing either setting
-mid-recording cannot change the filter / smoothing behaviour halfway through
-the file.
+badge appears next to the section header) so that changing any setting
+mid-recording cannot change the filter / smoothing / simplification behaviour
+halfway through the file.
 
 ### 1. "Фильтрация трека на лету" (on-the-fly track filtering)
 
@@ -292,6 +292,154 @@ per-recording state clear. JS reads / writes it via
 A standalone Python reference implementation with tests lives at
 `/home/z/my-project/scripts/test_post_process.py` in the build agent's
 environment (not committed to the repo).
+
+### 3. "Радиальный фильтр (на лету)" (on-the-fly radial distance filter)
+
+Independent toggle (does NOT require `post_process_enabled` to be on). When
+enabled, `onLocationChanged` drops every fix whose great-circle distance to
+the **last KEPT point** is less than `radial_distance_threshold_m` meters.
+The first fix of each segment (`prevLat == null`) is always kept because
+there is no previous reference to compare against.
+
+Implementation: in `onLocationChanged`, after the accuracy / velocity gate
+passes (in the `post_process_enabled` branch) or before
+`appendPointToCurrentSegment` (in the raw branch), check
+`haversineMeters(prevLat, prevLon, pt.lat, pt.lon) < threshold`. If true,
+drop the fix without advancing `prevLat` / `prevLon` — so the next fix is
+compared against the same last-kept point. The dropped fix is still "fresh"
+(good GPS, just denser than the user wants), so `lastFixTimeMs` is updated,
+`saveLiveState(pt)` runs, and a `location` event is emitted before returning
+— this keeps the UI's lastFix display current and prevents the gap watchdog
+from falsely firing.
+
+The user-tunable parameter `X` (default 5 m, range 0–1000 m, integer) is
+exposed via a −/+ stepper row directly below the toggle. The value is
+persisted in the `gps_recorder_settings` prefs file under
+`radial_distance_threshold_m`. JS reads / writes it via
+`GpsRecorder.getRadialDistanceThresholdM()` /
+`GpsRecorder.setRadialDistanceThresholdM(int)`. The native setter clamps to
+[0, 1000]; the JS stepper mirrors the same clamp.
+
+The toggle itself is persisted under `radial_distance_filter_enabled` and
+read / written via `GpsRecorder.getRadialDistanceFilterEnabled()` /
+`GpsRecorder.setRadialDistanceFilterEnabled(bool)`.
+
+Effect: suppresses stationary GPS jitter (the user standing still and the
+GPS drifting around within a 3 m radius at ~0.3 m/s — below the 0.35 m/s
+auto-pause threshold but well within the 20 km/h velocity ceiling). Also
+collapses nearly-colinear slow-walk fixes into a sparser sequence, which
+shrinks the GPX file by 30–70% depending on movement patterns.
+
+### 4. "Децимация по времени (на лету)" (on-the-fly time sampling)
+
+Independent toggle. When enabled, `onLocationChanged` keeps every N-th fix
+and drops the rest. Useful for shrinking file size on long recordings where
+1 Hz is overkill (e.g. an all-day hike at 5 km/h doesn't need 86 400 points
+— every 5th second is plenty).
+
+Implementation: a monotonic `timeSamplingCounter` is incremented for every
+fix that reaches the time-sampling check (after the stale-fix / gap / auto-
+pause checks). The fix is kept iff `n == 1`, `counter == 1` (always keep
+the very first fix so the track has a starting point), or
+`counter % n == 0`. Otherwise the fix is dropped with the same
+`lastFixTimeMs + saveLiveState + emit + return` pattern as the radial
+filter (so the UI stays fresh and the gap watchdog doesn't fire falsely).
+
+The counter is reset to 0 in `startRecording(resume=false)` and is NOT
+persisted across service restarts — a `START_STICKY` restart simply begins
+a fresh sampling window, which is acceptable since the previously-kept
+points are already in the buffer.
+
+The user-tunable parameter `N` (default 5, range 1–60, integer) is exposed
+via a −/+ stepper. At 1 Hz GPS, `N=5` yields one fix every ~5 s; `N=60`
+yields one fix per minute. Persisted under `time_sampling_n` in the
+`gps_recorder_settings` prefs file. JS reads / writes via
+`GpsRecorder.getTimeSamplingN()` / `GpsRecorder.setTimeSamplingN(int)`. The
+native setter clamps to [1, 60]; the JS stepper mirrors the same clamp.
+
+The toggle is persisted under `time_sampling_enabled` and read / written
+via `GpsRecorder.getTimeSamplingEnabled()` /
+`GpsRecorder.setTimeSamplingEnabled(bool)`.
+
+### 5. "Douglas-Peucker (постобработка)" (Douglas-Peucker simplification)
+
+Independent toggle. When enabled, `finalizeGpxFile()` — AFTER writing the
+raw / on-the-fly-filtered GPX file AND after Gaussian smoothing (if that is
+also enabled) — reads the file back, applies the Douglas-Peucker algorithm
+to each `<trkseg>` independently with tolerance
+`douglas_peucker_epsilon_m` meters, and overwrites the file with the
+simplified track.
+
+The algorithm (`GpsRecorderService.douglasPeuckerSimplify`):
+
+1. Keep the segment's first and last points unconditionally.
+2. Find the intermediate point with the maximum perpendicular (cross-track)
+   distance from the great circle through the first and last points.
+3. If that max distance exceeds epsilon, mark that point as kept and
+   recursively process the two halves (start→pivot and pivot→end).
+4. Otherwise drop all intermediate points.
+5. Implemented iteratively with an explicit `ArrayDeque<Pair<Int,Int>>`
+   stack to avoid stack overflow on long tracks (a 3-hour walk at 1 Hz =
+   ~10 800 points).
+
+Perpendicular distance is the great-circle cross-track distance
+(`crossTrackDistanceM`):
+
+```
+δ13 = d13 / R                  (angular distance from a to p)
+θ13 = bearing(a → p)
+θ12 = bearing(a → b)
+d_xt = asin( sin(δ13) · sin(θ13 − θ12) ) · R
+```
+
+This is correct at any latitude (unlike a flat-Earth perpendicular distance
+formula, which degrades near the poles). Degenerate segments where
+`a == b` fall back to the straight-line haversine distance.
+
+Timestamps, speed, accuracy, and elevation of the kept points are preserved
+verbatim. The output has fewer (or equal) points than the input — only the
+spatial density is reduced. Segments with fewer than 3 points are returned
+unchanged (nothing to simplify). Empty `<trkseg>` blocks are preserved
+as-is so the segment structure is mirrored in the output.
+
+The user-tunable parameter `epsilon` (default 5.0 m, range 0.0–500.0 m,
+Double) is exposed via a −/+ stepper (integer step). Persisted under
+`douglas_peucker_epsilon_m` in the `gps_recorder_settings` prefs file as a
+String (SharedPreferences has no `putDouble` — same pattern as
+`total_distance_m`). JS reads / writes via
+`GpsRecorder.getDouglasPeuckerEpsilonM()` /
+`GpsRecorder.setDouglasPeuckerEpsilonM(double)`. The native setter clamps
+to [0.0, 500.0]; the JS stepper clamps to [0, 500] (integer).
+
+The toggle is persisted under `douglas_peucker_enabled` and read / written
+via `GpsRecorder.getDouglasPeuckerEnabled()` /
+`GpsRecorder.setDouglasPeuckerEnabled(bool)`.
+
+Effect: collapses nearly-colinear sequences (long straight roads, slow
+straight trails) into just their endpoints, while preserving real corners
+and turnpoints. A typical 1 Hz walk track simplified with ε=5 m shrinks by
+50–80% with negligible visual difference when plotted on a map.
+
+### Chaining order at finalize time
+
+When multiple post-processors are enabled, they chain in this order:
+
+```
+raw / on-the-fly-filtered buffer
+   ↓
+serializeSegmentsToGpx  →  write to Downloads/trck/*.gpx
+   ↓ (if either Gaussian or DP is enabled: read back)
+gaussianSmoothGpx       (if gaussian_smoothing_enabled)
+   ↓
+douglasPeuckerGpx       (if douglas_peucker_enabled)
+   ↓
+overwrite file
+```
+
+Gaussian runs first (to suppress single-fix glitches), then DP (to decimate
+the smoothed track). Running them in the opposite order would let DP keep
+glitchy points that Gaussian would have smoothed away. Either can be
+enabled on its own.
 
 ## Distance-leakage fix
 

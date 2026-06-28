@@ -40,6 +40,18 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  *   - getPostProcessEnabled()      -> Promise<Boolean>
  *   - setGaussianSmoothingEnabled(b) -> Promise<Boolean> (post-process Gaussian smoother)
  *   - getGaussianSmoothingEnabled() -> Promise<Boolean>
+ *   - setRadialDistanceFilterEnabled(b) -> Promise<Boolean> (on-the-fly radial distance filter)
+ *   - getRadialDistanceFilterEnabled()  -> Promise<Boolean>
+ *   - setRadialDistanceThresholdM(n)    -> Promise<Int>    (clamp [0,1000])
+ *   - getRadialDistanceThresholdM()     -> Promise<Int>
+ *   - setTimeSamplingEnabled(b)     -> Promise<Boolean> (on-the-fly keep every N-th fix)
+ *   - getTimeSamplingEnabled()      -> Promise<Boolean>
+ *   - setTimeSamplingN(n)           -> Promise<Int>    (clamp [1,60])
+ *   - getTimeSamplingN()            -> Promise<Int>
+ *   - setDouglasPeuckerEnabled(b)   -> Promise<Boolean> (post-process Douglas-Peucker simplifier)
+ *   - getDouglasPeuckerEnabled()    -> Promise<Boolean>
+ *   - setDouglasPeuckerEpsilonM(d)  -> Promise<Double> (clamp [0,500])
+ *   - getDouglasPeuckerEpsilonM()   -> Promise<Double>
  *   - setAutoPauseEnabled(b)       -> Promise<Boolean> (auto-pause on stop detection)
  *   - getAutoPauseEnabled()        -> Promise<Boolean>
  *   - setGapDetectionEnabled(b)    -> Promise<Boolean> (gap detection on signal loss)
@@ -468,6 +480,181 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(settingsPrefs().getBoolean("gaussian_smoothing_enabled", false))
         } catch (e: Exception) {
             promise.reject("E_SETTINGS", e.message ?: "getGaussianSmoothingEnabled error", e)
+        }
+    }
+
+    // ---- Radial-distance on-the-fly filter ----
+    //
+    // Independent toggle (does NOT require post_process_enabled). When on,
+    // GpsRecorderService.onLocationChanged drops every fix whose great-circle
+    // distance to the LAST KEPT point is < radial_distance_threshold_m meters.
+    // The first fix of each segment is always kept (no previous reference).
+    //
+    // Persisted in the same "gps_recorder_settings" prefs file so it survives
+    // the per-recording state clear. Default off, default threshold 5 m.
+
+    @ReactMethod
+    fun setRadialDistanceFilterEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("radial_distance_filter_enabled", enabled).apply()
+            Log.i(TAG, "Radial distance filter enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setRadialDistanceFilterEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getRadialDistanceFilterEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("radial_distance_filter_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getRadialDistanceFilterEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun setRadialDistanceThresholdM(thresholdM: Int, promise: Promise) {
+        try {
+            // Clamp to [0, 1000] — 0 disables (everything is "too close"),
+            // 1000 m is an absurd upper bound for a walk/run filter.
+            val clamped = thresholdM.coerceIn(0, 1000)
+            settingsPrefs().edit().putInt("radial_distance_threshold_m", clamped).apply()
+            Log.i(TAG, "Radial distance threshold = $clamped m")
+            promise.resolve(clamped)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setRadialDistanceThresholdM error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getRadialDistanceThresholdM(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getInt("radial_distance_threshold_m", 5))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getRadialDistanceThresholdM error", e)
+        }
+    }
+
+    // ---- Time-sampling on-the-fly filter ----
+    //
+    // Independent toggle. When on, GpsRecorderService.onLocationChanged keeps
+    // every N-th fix and drops the rest. Useful for shrinking file size on
+    // long recordings where 1 Hz is overkill. The counter resets at the start
+    // of each recording (and is not persisted across service restarts — a
+    // restart simply begins a fresh sampling window).
+    //
+    // Persisted in the same "gps_recorder_settings" prefs file. Default off,
+    // default N = 5 (i.e. keep one fix every ~5 s at 1 Hz).
+
+    @ReactMethod
+    fun setTimeSamplingEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("time_sampling_enabled", enabled).apply()
+            Log.i(TAG, "Time sampling enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setTimeSamplingEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getTimeSamplingEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("time_sampling_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getTimeSamplingEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun setTimeSamplingN(n: Int, promise: Promise) {
+        try {
+            // Clamp to [1, 60] — 1 means "keep every fix" (no-op), 60 means
+            // keep one fix per minute at 1 Hz.
+            val clamped = n.coerceIn(1, 60)
+            settingsPrefs().edit().putInt("time_sampling_n", clamped).apply()
+            Log.i(TAG, "Time sampling N = $clamped")
+            promise.resolve(clamped)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setTimeSamplingN error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getTimeSamplingN(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getInt("time_sampling_n", 5))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getTimeSamplingN error", e)
+        }
+    }
+
+    // ---- Douglas-Peucker post-processing ----
+    //
+    // Independent toggle. When on, GpsRecorderService.finalizeGpxFile will —
+    // AFTER writing the raw / on-the-fly-filtered GPX file (and AFTER Gaussian
+    // smoothing, if that is also enabled) — read the file back, apply the
+    // Douglas-Peucker algorithm to each <trkseg> independently with tolerance
+    // `douglas_peucker_epsilon_m` meters, and overwrite the file with the
+    // simplified track.
+    //
+    // The algorithm: recursively keep the point of maximum perpendicular
+    // distance from the line connecting the segment's first and last points;
+    // if that max distance exceeds epsilon, split there and recurse on both
+    // halves; otherwise drop all intermediate points. Implemented iteratively
+    // to avoid stack overflow on long tracks.
+    //
+    // Perpendicular distance is computed as the great-circle cross-track
+    // distance (so it's correct at any latitude, not just near the equator).
+    //
+    // Persisted in the same "gps_recorder_settings" prefs file. Default off,
+    // default epsilon 5.0 m. Epsilon is stored as a string (Double.toString)
+    // because SharedPreferences has no putDouble; this matches how the
+    // service already persists totalDistanceM.
+
+    @ReactMethod
+    fun setDouglasPeuckerEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("douglas_peucker_enabled", enabled).apply()
+            Log.i(TAG, "Douglas-Peucker enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setDouglasPeuckerEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getDouglasPeuckerEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("douglas_peucker_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getDouglasPeuckerEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun setDouglasPeuckerEpsilonM(epsilonM: Double, promise: Promise) {
+        try {
+            // Clamp to [0.0, 500.0] — 0 keeps only segment endpoints (extreme
+            // simplification), 500 m is an absurd upper bound for walk/run.
+            val clamped = epsilonM.coerceIn(0.0, 500.0)
+            settingsPrefs().edit().putString("douglas_peucker_epsilon_m", clamped.toString()).apply()
+            Log.i(TAG, "Douglas-Peucker epsilon = $clamped m")
+            promise.resolve(clamped)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setDouglasPeuckerEpsilonM error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getDouglasPeuckerEpsilonM(promise: Promise) {
+        try {
+            val s = settingsPrefs().getString("douglas_peucker_epsilon_m", null)
+            val v = s?.toDoubleOrNull() ?: 5.0
+            promise.resolve(v)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getDouglasPeuckerEpsilonM error", e)
         }
     }
 

@@ -176,6 +176,19 @@ class GpsRecorderService : Service(), LocationListener {
         // If no GPS fix arrives for this many ms, declare a signal gap and
         // split the track into a new <trkseg> when the next fix does arrive.
         private const val GAP_THRESHOLD_MS = 15_000L
+
+        // ---- Radial-distance on-the-fly filter (defaults; user-tunable) ----
+        // Prefs keys + defaults are owned by GpsRecorderModule, but the
+        // service reads them via getRadialDistanceThresholdM(). The defaults
+        // here are only used if the prefs file is empty (first launch).
+        private const val DEFAULT_RADIAL_DISTANCE_THRESHOLD_M = 5
+
+        // ---- Time-sampling on-the-fly filter (defaults; user-tunable) ----
+        private const val DEFAULT_TIME_SAMPLING_N = 5
+
+        // ---- Douglas-Peucker post-processing (defaults; user-tunable) ----
+        // Epsilon in meters; the service reads it via getDouglasPeuckerEpsilonM().
+        private const val DEFAULT_DOUGLAS_PEUCKER_EPSILON_M = 5.0
     }
 
     private var locationManager: LocationManager? = null
@@ -236,6 +249,15 @@ class GpsRecorderService : Service(), LocationListener {
     // When auto-pause is disabled, this stays equal to elapsedMs.
     @Volatile private var movingMs: Long = 0L
     @Volatile private var lastResumeMs: Long? = null
+
+    // ---- Time-sampling on-the-fly filter state ----
+    // Monotonic counter incremented for EVERY fix that arrives (after the
+    // stale-fix / gap / auto-pause checks). When time_sampling_enabled is
+    // on, only fixes where (counter % N == 0) are kept; the rest are
+    // dropped before any other gate runs. Reset to 0 in startRecording()
+    // so each recording starts a fresh sampling window. Not persisted across
+    // service restarts — a restart simply begins a new window.
+    @Volatile private var timeSamplingCounter: Int = 0
 
     // Duration tick runnable
     private val durationTick = object : Runnable {
@@ -416,6 +438,12 @@ class GpsRecorderService : Service(), LocationListener {
             // Phase 6: reset moving-time accumulator.
             movingMs = 0L
             lastResumeMs = startTimeMs
+            // Reset the time-sampling counter so the new recording starts at
+            // fix #1 (which is always kept under any N because 1 % N != 0 is
+            // false only for N=1; we treat the very first fix specially — see
+            // onLocationChanged — so the first fix of a recording is always
+            // kept regardless of N).
+            timeSamplingCounter = 0
             tempFileName = "gps_temp_${startTimeMs}.gpx"
         }
         isRecording = true
@@ -1137,6 +1165,37 @@ class GpsRecorderService : Service(), LocationListener {
         // so the GPX buffer only ever contains clean, validated fixes and there is
         // nothing left to post-process at finalization. When it is off, every fix
         // is recorded raw (the fallback / diagnostic mode).
+        //
+        // ---- Time-sampling on-the-fly filter (independent toggle) ----
+        // Keep every N-th fix; drop the rest. The dropped fix is still "fresh"
+        // (it's a good GPS fix, just denser than the user wants), so we update
+        // lastFixTimeMs + saveLiveState + emit before returning. This keeps the
+        // UI's lastFix display current and prevents the gap watchdog from
+        // falsely firing (since lastFixTimeMs advances on every fix, kept or
+        // dropped).
+        //
+        // The counter is reset to 0 in startRecording() and incremented for
+        // every fix that reaches this point. The first fix of a recording
+        // (counter == 1 after the increment below) is ALWAYS kept so the
+        // track has a starting point even when N > 1.
+        if (isTimeSamplingEnabled()) {
+            timeSamplingCounter++
+            val n = getTimeSamplingN().coerceAtLeast(1)
+            val keep = (n == 1) || (timeSamplingCounter == 1) || (timeSamplingCounter % n == 0)
+            if (!keep) {
+                Log.d(TAG, "Time sampling: dropping fix #${timeSamplingCounter} (n=$n)")
+                lastFixTimeMs = pt.timeMs
+                saveLiveState(pt)
+                GpsRecorderModule.emitLocation(
+                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                    computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                    isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                )
+                updateNotification()
+                return
+            }
+        }
+
         if (isPostProcessEnabled()) {
             // B. Accuracy gate: skip fixes whose reported accuracy is worse than the
             // threshold. These are almost always multipath or cold-start noise.
@@ -1176,6 +1235,37 @@ class GpsRecorderService : Service(), LocationListener {
                     return
                 }
                 totalDistanceM += d
+                // ---- Radial-distance on-the-fly filter (independent toggle) ----
+                // Drops the candidate if it is closer than threshold meters to
+                // the last KEPT point (which is what prevLat/prevLon currently
+                // point to — they only advance after a fix is appended below).
+                // This is independent of the accuracy / velocity gate above; it
+                // can be enabled on its own to suppress stationary GPS jitter
+                // that the velocity gate considers plausible (e.g. the user
+                // standing still and the GPS drifting around within a 3 m
+                // radius at ~0.3 m/s — below the 0.35 m/s auto-pause threshold
+                // but well within the 20 km/h velocity ceiling).
+                //
+                // We re-use the haversine distance `d` already computed above so
+                // we don't pay for a second haversine call. The dropped fix is
+                // still "fresh" (good GPS), so we update lastFixTimeMs +
+                // saveLiveState + emit before returning — same pattern as the
+                // time-sampling drop above.
+                if (isRadialDistanceFilterEnabled()) {
+                    val threshold = getRadialDistanceThresholdM().toDouble()
+                    if (d < threshold) {
+                        Log.d(TAG, "Radial filter: dropping too-close fix (d=${d}m < ${threshold}m)")
+                        lastFixTimeMs = pt.timeMs
+                        saveLiveState(pt)
+                        GpsRecorderModule.emitLocation(
+                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                        )
+                        updateNotification()
+                        return
+                    }
+                }
             }
             // D. Point passed both gates — commit it to the current segment and
             // advance the previous-fix cursor.
@@ -1185,6 +1275,31 @@ class GpsRecorderService : Service(), LocationListener {
             prevTimeMs = pt.timeMs
             lastFixTimeMs = pt.timeMs
         } else {
+            // ---- Radial-distance on-the-fly filter (raw mode) ----
+            // Same logic as in the post_process branch above, but we have to
+            // compute the haversine ourselves because the velocity gate runs
+            // inside accumulateDistance() and we don't have a `d` in scope.
+            // We check against prevLat (last KEPT point) before appending.
+            if (isRadialDistanceFilterEnabled()) {
+                val pLat = prevLat
+                val pLon = prevLon
+                if (pLat != null && pLon != null) {
+                    val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+                    val threshold = getRadialDistanceThresholdM().toDouble()
+                    if (d < threshold) {
+                        Log.d(TAG, "Radial filter (raw): dropping too-close fix (d=${d}m < ${threshold}m)")
+                        lastFixTimeMs = pt.timeMs
+                        saveLiveState(pt)
+                        GpsRecorderModule.emitLocation(
+                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                        )
+                        updateNotification()
+                        return
+                    }
+                }
+            }
             // E. Fallback: record every fix raw so the GPX file keeps the noisy
             // data, but still keep the displayed distance sane by routing the
             // accuracy/velocity gates through the distance accumulator only.
@@ -1513,6 +1628,57 @@ class GpsRecorderService : Service(), LocationListener {
     }
 
     /**
+     * Reads the radial-distance on-the-fly filter setting from the separate
+     * settings prefs file. When enabled, onLocationChanged drops every fix
+     * whose great-circle distance to the LAST KEPT point is < threshold
+     * (see [getRadialDistanceThresholdM]). The first fix of each segment
+     * (prevLat == null) is always kept.
+     */
+    private fun isRadialDistanceFilterEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean("radial_distance_filter_enabled", false)
+    }
+
+    private fun getRadialDistanceThresholdM(): Int {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getInt("radial_distance_threshold_m", DEFAULT_RADIAL_DISTANCE_THRESHOLD_M)
+    }
+
+    /**
+     * Reads the time-sampling on-the-fly filter setting. When enabled,
+     * onLocationChanged keeps every N-th fix (counter % N == 0) and drops
+     * the rest. The very first fix of a recording is always kept so the
+     * track has a starting point even if N > 1.
+     */
+    private fun isTimeSamplingEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean("time_sampling_enabled", false)
+    }
+
+    private fun getTimeSamplingN(): Int {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getInt("time_sampling_n", DEFAULT_TIME_SAMPLING_N)
+    }
+
+    /**
+     * Reads the Douglas-Peucker post-processing setting. When enabled,
+     * finalizeGpxFile() — AFTER writing the raw / on-the-fly-filtered GPX
+     * file AND after Gaussian smoothing (if that is also enabled) — reads
+     * the file back, applies Douglas-Peucker to each <trkseg> independently,
+     * and overwrites the file with the simplified track.
+     */
+    private fun isDouglasPeuckerEnabled(): Boolean {
+        return getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getBoolean("douglas_peucker_enabled", false)
+    }
+
+    private fun getDouglasPeuckerEpsilonM(): Double {
+        val s = getSharedPreferences("gps_recorder_settings", Context.MODE_PRIVATE)
+            .getString("douglas_peucker_epsilon_m", null)
+        return s?.toDoubleOrNull() ?: DEFAULT_DOUGLAS_PEUCKER_EPSILON_M
+    }
+
+    /**
      * Writes the GPX header (and the opening <trk> / <name> tags only) to
      * the temp file, replacing any previous content. The temp file lives
      * in the app's cache dir so it survives the JS app being killed but is
@@ -1628,21 +1794,40 @@ class GpsRecorderService : Service(), LocationListener {
         // On-the-fly filtering (if enabled) was already applied in onLocationChanged,
         // so the buffer is clean by this point. The legacy offline post-processor
         // (postProcessGpx) is intentionally NOT invoked here — it has been superseded
-        // by the on-the-fly filter. The only optional finalize-time step left is the
-        // Gaussian kernel smoothing, controlled by its own setting.
+        // by the on-the-fly filter. The optional finalize-time steps are:
+        //   1. Gaussian kernel smoothing (controlled by its own setting).
+        //   2. Douglas-Peucker simplification (controlled by its own setting).
+        // They chain in that order: Gaussian first (to suppress single-fix
+        // glitches), then DP (to decimate the smoothed track). Either can be
+        // enabled on its own.
         val doGaussian = isGaussianSmoothingEnabled()
+        val doDouglasPeucker = isDouglasPeuckerEnabled()
+        val dpEpsilon = getDouglasPeuckerEpsilonM()
         Log.i(
             TAG,
             "finalizeGpxFile: segments=${segments.size} points=$totalPoints" +
                 " onTheFlyFilter=${isPostProcessEnabled()} gaussianSmoothing=$doGaussian" +
+                " douglasPeucker=$doDouglasPeucker dpEpsilon=${dpEpsilon}m" +
+                " radialFilter=${isRadialDistanceFilterEnabled()}" +
+                " timeSampling=${isTimeSamplingEnabled()}" +
                 " autoPause=${isAutoPauseEnabled()}"
         )
 
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(fileName, rawBytes, gaussianSmooth = doGaussian)
+                saveViaMediaStore(
+                    fileName, rawBytes,
+                    gaussianSmooth = doGaussian,
+                    douglasPeucker = doDouglasPeucker,
+                    douglasPeuckerEpsilon = dpEpsilon
+                )
             } else {
-                saveViaLegacyFile(fileName, rawBytes, gaussianSmooth = doGaussian)
+                saveViaLegacyFile(
+                    fileName, rawBytes,
+                    gaussianSmooth = doGaussian,
+                    douglasPeucker = doDouglasPeucker,
+                    douglasPeuckerEpsilon = dpEpsilon
+                )
             }
         } catch (e: Exception) {
             Log.e(TAG, "finalizeGpxFile failed; falling back to cache", e)
@@ -1664,7 +1849,9 @@ class GpsRecorderService : Service(), LocationListener {
     private fun saveViaMediaStore(
         fileName: String,
         rawBytes: ByteArray,
-        gaussianSmooth: Boolean = false
+        gaussianSmooth: Boolean = false,
+        douglasPeucker: Boolean = false,
+        douglasPeuckerEpsilon: Double = 5.0
     ): String {
         val resolver = contentResolver
         val values = android.content.ContentValues().apply {
@@ -1690,25 +1877,40 @@ class GpsRecorderService : Service(), LocationListener {
                 out.flush()
             } ?: throw java.io.IOException("Cannot open output stream for $uri")
 
-            // Step 2: if Gaussian smoothing is enabled, read the raw file back,
-            // apply the kernel smoother, and OVERWRITE the file with the smoothed
-            // track.
-            if (gaussianSmooth) {
+            // Step 2: if any finalize-time post-processor is enabled, read the
+            // raw file back, run the post-processing pipeline (Gaussian then
+            // Douglas-Peucker, in that order), and OVERWRITE the file with the
+            // processed track.
+            if (gaussianSmooth || douglasPeucker) {
                 val rawText = resolver.openInputStream(uri)?.use { it.readBytes() }
                     ?.toString(Charsets.UTF_8) ?: ""
-                val smoothedText = try {
-                    gaussianSmoothGpx(rawText)
-                } catch (e: Exception) {
-                    Log.e(TAG, "gaussianSmoothGpx failed; keeping raw file", e)
-                    rawText
+                var processed = rawText
+                if (gaussianSmooth) {
+                    processed = try {
+                        gaussianSmoothGpx(processed)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "gaussianSmoothGpx failed; keeping pre-smoothing content", e)
+                        processed
+                    }
                 }
-                val smoothedBytes = smoothedText.toByteArray(Charsets.UTF_8)
+                if (douglasPeucker) {
+                    val before = countTrkpt(processed)
+                    processed = try {
+                        douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "douglasPeuckerGpx failed; keeping pre-DP content", e)
+                        processed
+                    }
+                    val after = countTrkpt(processed)
+                    Log.i(TAG, "Douglas-Peucker applied (epsilon=${douglasPeuckerEpsilon}m): $before -> $after points")
+                }
+                val processedBytes = processed.toByteArray(Charsets.UTF_8)
                 // "wt" = write-truncate: replaces the file's contents.
                 resolver.openOutputStream(uri, "wt")?.use { out: OutputStream ->
-                    out.write(smoothedBytes)
+                    out.write(processedBytes)
                     out.flush()
-                } ?: throw java.io.IOException("Cannot reopen output stream for $uri (gaussian)")
-                Log.i(TAG, "Gaussian-smoothed GPX written (${smoothedBytes.size} bytes)")
+                } ?: throw java.io.IOException("Cannot reopen output stream for $uri (post-process)")
+                Log.i(TAG, "Post-processed GPX written via MediaStore (${processedBytes.size} bytes)")
             }
         } finally {
             // Mark as not pending so it becomes visible, regardless of whether
@@ -1724,7 +1926,9 @@ class GpsRecorderService : Service(), LocationListener {
     private fun saveViaLegacyFile(
         fileName: String,
         rawBytes: ByteArray,
-        gaussianSmooth: Boolean = false
+        gaussianSmooth: Boolean = false,
+        douglasPeucker: Boolean = false,
+        douglasPeuckerEpsilon: Double = 5.0
     ): String {
         @Suppress("DEPRECATION")
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
@@ -1732,17 +1936,32 @@ class GpsRecorderService : Service(), LocationListener {
         val f = File(targetDir, fileName)
         // Step 1: write raw bytes.
         FileOutputStream(f).use { it.write(rawBytes) }
-        // Step 2: if Gaussian smoothing is enabled, read back, smooth, overwrite.
-        if (gaussianSmooth) {
-            val rawText = f.readText(Charsets.UTF_8)
-            val smoothedText = try {
-                gaussianSmoothGpx(rawText)
-            } catch (e: Exception) {
-                Log.e(TAG, "gaussianSmoothGpx failed; keeping raw file", e)
-                rawText
+        // Step 2: if any finalize-time post-processor is enabled, read back,
+        // run the post-processing pipeline (Gaussian then Douglas-Peucker),
+        // overwrite.
+        if (gaussianSmooth || douglasPeucker) {
+            var processed = f.readText(Charsets.UTF_8)
+            if (gaussianSmooth) {
+                processed = try {
+                    gaussianSmoothGpx(processed)
+                } catch (e: Exception) {
+                    Log.e(TAG, "gaussianSmoothGpx failed; keeping pre-smoothing content", e)
+                    processed
+                }
             }
-            FileOutputStream(f).use { it.write(smoothedText.toByteArray(Charsets.UTF_8)) }
-            Log.i(TAG, "Gaussian-smoothed GPX written to ${f.absolutePath}")
+            if (douglasPeucker) {
+                val before = countTrkpt(processed)
+                processed = try {
+                    douglasPeuckerGpx(processed, douglasPeuckerEpsilon)
+                } catch (e: Exception) {
+                    Log.e(TAG, "douglasPeuckerGpx failed; keeping pre-DP content", e)
+                    processed
+                }
+                val after = countTrkpt(processed)
+                Log.i(TAG, "Douglas-Peucker applied (epsilon=${douglasPeuckerEpsilon}m): $before -> $after points")
+            }
+            FileOutputStream(f).use { it.write(processed.toByteArray(Charsets.UTF_8)) }
+            Log.i(TAG, "Post-processed GPX written to ${f.absolutePath}")
         }
         return f.absolutePath
     }
@@ -2008,6 +2227,198 @@ class GpsRecorderService : Service(), LocationListener {
                 " half-window=$GAUSSIAN_HALF_WINDOW sigma=$GAUSSIAN_SIGMA"
         )
         return sb.toString()
+    }
+
+    /**
+     * Douglas-Peucker simplification of the GPX track.
+     *
+     * For each <trkseg>, applies the iterative Douglas-Peucker algorithm with
+     * tolerance [epsilonM] meters: keeps the segment's first and last points
+     * unconditionally, then recursively keeps the point of maximum
+     * perpendicular distance from the line connecting the segment's current
+     * endpoints — if that max distance exceeds epsilon, split there and
+     * recurse on both halves; otherwise drop all intermediate points.
+     *
+     * Perpendicular distance is computed as the great-circle cross-track
+     * distance (correct at any latitude, not just near the equator). The
+     * algorithm is implemented iteratively with an explicit stack to avoid
+     * stack overflow on long tracks (a 3-hour walk at 1 Hz = ~10 800 points,
+     * which would blow the JVM default stack at recursion depth ~10 800).
+     *
+     * Timestamps, speed, accuracy, and elevation of the kept points are
+     * preserved verbatim. The output has fewer (or equal) points than the
+     * input — only the spatial density is reduced.
+     *
+     * Segments with < 3 points are returned unchanged (nothing to simplify).
+     * Empty <trkseg> blocks are preserved as-is so the segment structure of
+     * the input is mirrored in the output.
+     *
+     * If parsing fails or no <trkseg> is found, the input is returned
+     * unchanged so the user still gets a usable (raw / pre-DP) file.
+     */
+    private fun douglasPeuckerGpx(rawGpx: String, epsilonM: Double): String {
+        val segRegex = Regex("<trkseg>(.*?)</trkseg>", RegexOption.DOT_MATCHES_ALL)
+        val ptRegex = Regex("<trkpt lat=\"([^\"]+)\" lon=\"([^\"]+)\">(.*?)</trkpt>", RegexOption.DOT_MATCHES_ALL)
+
+        val segmentMatches = segRegex.findAll(rawGpx).toList()
+        if (segmentMatches.isEmpty()) {
+            Log.w(TAG, "douglasPeuckerGpx: no <trkseg> found, returning raw input")
+            return rawGpx
+        }
+
+        val origName = Regex("<name>([^<]*)</name>").find(rawGpx)?.groupValues?.get(1)
+            ?: "GPS Recording"
+
+        val sb = StringBuilder()
+        sb.append(gpxHeader())
+        sb.append("  <trk>\n")
+        sb.append("    <name>").append(origName).append("</name>\n")
+
+        var totalIn = 0
+        var totalOut = 0
+        for (segMatch in segmentMatches) {
+            val segContent = segMatch.groupValues[1]
+            val parsed = mutableListOf<GpxTrkPt>()
+            for (m in ptRegex.findAll(segContent)) {
+                val lat = m.groupValues[1].toDoubleOrNull() ?: continue
+                val lon = m.groupValues[2].toDoubleOrNull() ?: continue
+                val inner = m.groupValues[3]
+                val ele = Regex("<ele>([^<]+)</ele>").find(inner)?.groupValues?.get(1)?.toDoubleOrNull()
+                val speed = Regex("<speed>([^<]+)</speed>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+                val acc = Regex("<accuracy>([^<]+)</accuracy>").find(inner)?.groupValues?.get(1)?.toFloatOrNull()
+                val timeIso = Regex("<time>([^<]+)</time>").find(inner)?.groupValues?.get(1)
+                val timeMs = parseIsoTime(timeIso) ?: continue
+                parsed.add(GpxTrkPt(lat, lon, ele, speed, acc, timeMs, interpolated = false))
+            }
+            totalIn += parsed.size
+            if (parsed.isEmpty()) {
+                // Preserve empty <trkseg> blocks as-is so the segment
+                // structure is preserved in the output.
+                sb.append("    <trkseg>\n")
+                sb.append("    </trkseg>\n")
+                continue
+            }
+
+            val kept = if (parsed.size < 3 || epsilonM <= 0.0) {
+                // Nothing to simplify: keep all points verbatim.
+                parsed
+            } else {
+                douglasPeuckerSimplify(parsed, epsilonM)
+            }
+            totalOut += kept.size
+
+            sb.append("    <trkseg>\n")
+            for (p in kept) {
+                sb.append(formatGpxPointWithInterpolated(p))
+            }
+            sb.append("    </trkseg>\n")
+        }
+        sb.append("  </trk>\n")
+        sb.append("</gpx>\n")
+        Log.i(
+            TAG,
+            "douglasPeuckerGpx: segments=${segmentMatches.size} points in=$totalIn out=$totalOut" +
+                " epsilon=${epsilonM}m"
+        )
+        return sb.toString()
+    }
+
+    /**
+     * Iterative Douglas-Peucker. Returns the subset of [points] that survives
+     * simplification with tolerance [epsilonM] meters. The first and last
+     * points are always kept. Intermediate points are kept iff their
+     * perpendicular (cross-track) distance from the line connecting the
+     * current endpoints exceeds epsilon, in which case the segment is split
+     * there and each half is processed independently.
+     *
+     * Uses an explicit ArrayDeque as the stack so we don't blow the JVM call
+     * stack on long tracks.
+     */
+    private fun douglasPeuckerSimplify(
+        points: List<GpxTrkPt>,
+        epsilonM: Double
+    ): List<GpxTrkPt> {
+        val n = points.size
+        if (n < 3) return points
+        val keep = BooleanArray(n) { false }
+        keep[0] = true
+        keep[n - 1] = true
+        val stack = ArrayDeque<Pair<Int, Int>>()
+        stack.addLast(0 to n - 1)
+        while (stack.isNotEmpty()) {
+            val (start, end) = stack.removeLast()
+            if (end - start < 2) continue
+            val a = points[start]
+            val b = points[end]
+            var maxDist = -1.0
+            var maxIdx = -1
+            for (i in start + 1 until end) {
+                val d = crossTrackDistanceM(points[i].lat, points[i].lon, a.lat, a.lon, b.lat, b.lon)
+                if (d > maxDist) {
+                    maxDist = d
+                    maxIdx = i
+                }
+            }
+            if (maxIdx >= 0 && maxDist > epsilonM) {
+                keep[maxIdx] = true
+                stack.addLast(start to maxIdx)
+                stack.addLast(maxIdx to end)
+            }
+        }
+        val out = ArrayList<GpxTrkPt>(n)
+        for (i in 0 until n) {
+            if (keep[i]) out.add(points[i])
+        }
+        return out
+    }
+
+    /**
+     * Great-circle cross-track distance: the perpendicular distance from
+     * point [pLat, pLon] to the great circle through [aLat, aLon] and
+     * [bLat, bLon], in meters. Always returned as a non-negative value.
+     *
+     * If a and b are the same point, falls back to the straight-line
+     * haversine distance from a to p (so the caller doesn't have to special-
+     * case degenerate segments).
+     *
+     * Formula:
+     *   δ13 = d13 / R            (angular distance from a to p)
+     *   θ13 = bearing(a → p)
+     *   θ12 = bearing(a → b)
+     *   d_xt = asin( sin(δ13) · sin(θ13 − θ12) ) · R
+     */
+    private fun crossTrackDistanceM(
+        pLat: Double, pLon: Double,
+        aLat: Double, aLon: Double,
+        bLat: Double, bLon: Double
+    ): Double {
+        // Degenerate segment: a and b coincide. Return haversine(a, p).
+        if (aLat == bLat && aLon == bLon) {
+            return haversineMeters(aLat, aLon, pLat, pLon)
+        }
+        val r = 6_371_000.0
+        val d13 = haversineMeters(aLat, aLon, pLat, pLon) / r
+        if (d13 == 0.0) return 0.0
+        val theta13 = bearingRad(aLat, aLon, pLat, pLon)
+        val theta12 = bearingRad(aLat, aLon, bLat, bLon)
+        val dXt = Math.asin(Math.sin(d13) * Math.sin(theta13 - theta12)) * r
+        return Math.abs(dXt)
+    }
+
+    /** Initial bearing from (lat1, lon1) to (lat2, lon2), in radians. */
+    private fun bearingRad(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val phi1 = Math.toRadians(lat1)
+        val phi2 = Math.toRadians(lat2)
+        val dLambda = Math.toRadians(lon2 - lon1)
+        val y = Math.sin(dLambda) * Math.cos(phi2)
+        val x = Math.cos(phi1) * Math.sin(phi2) -
+            Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLambda)
+        return Math.atan2(y, x)
+    }
+
+    /** Counts <trkpt> elements in a GPX document (used for post-process logging). */
+    private fun countTrkpt(gpx: String): Int {
+        return Regex("<trkpt ").findAll(gpx).count()
     }
 
     /**

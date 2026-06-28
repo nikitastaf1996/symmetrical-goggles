@@ -178,6 +178,18 @@ function App(): React.ReactElement {
   // Phase 4 toggle: gap detection (signal-loss segment splits). Defaults to
   // true so existing users keep the behaviour from the previous APK.
   const [gapDetectionEnabled, setGapDetectionEnabled] = useState<boolean>(true);
+  // Three independent data-reduction filters (user requested). Each has an
+  // enabled toggle plus a numeric parameter, exposed via the new
+  // setRadialDistanceFilter* / setTimeSampling* / setDouglasPeucker* bridge
+  // methods. All are persisted in the separate settings prefs file so they
+  // survive the per-recording state clear, and all are locked while a
+  // recording is in progress (see settingsLocked).
+  const [radialDistanceFilterEnabled, setRadialDistanceFilterEnabled] = useState<boolean>(false);
+  const [radialDistanceThresholdM, setRadialDistanceThresholdM] = useState<number>(5);
+  const [timeSamplingEnabled, setTimeSamplingEnabled] = useState<boolean>(false);
+  const [timeSamplingN, setTimeSamplingN] = useState<number>(5);
+  const [douglasPeuckerEnabled, setDouglasPeuckerEnabled] = useState<boolean>(false);
+  const [douglasPeuckerEpsilonM, setDouglasPeuckerEpsilonM] = useState<number>(5);
   const [isAutoPaused, setIsAutoPaused] = useState<boolean>(false);
   const [signalLost, setSignalLost] = useState<boolean>(false);
   const [movingMs, setMovingMs] = useState<number>(0);
@@ -285,6 +297,27 @@ function App(): React.ReactElement {
         try {
           const gd = await GpsRecorder.getGapDetectionEnabled();
           if (mounted) setGapDetectionEnabled(gd);
+        } catch { /* ignore */ }
+
+        // Load the three data-reduction filter settings from native prefs.
+        // Each has a boolean enabled flag + a numeric parameter.
+        try {
+          const rde = await GpsRecorder.getRadialDistanceFilterEnabled();
+          if (mounted) setRadialDistanceFilterEnabled(rde);
+          const rdt = await GpsRecorder.getRadialDistanceThresholdM();
+          if (mounted) setRadialDistanceThresholdM(rdt);
+        } catch { /* ignore */ }
+        try {
+          const tse = await GpsRecorder.getTimeSamplingEnabled();
+          if (mounted) setTimeSamplingEnabled(tse);
+          const tsn = await GpsRecorder.getTimeSamplingN();
+          if (mounted) setTimeSamplingN(tsn);
+        } catch { /* ignore */ }
+        try {
+          const dpe = await GpsRecorder.getDouglasPeuckerEnabled();
+          if (mounted) setDouglasPeuckerEnabled(dpe);
+          const dpeps = await GpsRecorder.getDouglasPeuckerEpsilonM();
+          if (mounted) setDouglasPeuckerEpsilonM(dpeps);
         } catch { /* ignore */ }
 
         // Start the always-on GNSS monitor so the UI shows fix status even
@@ -572,6 +605,95 @@ function App(): React.ReactElement {
       setErrorMsg(e?.message ?? String(e));
     }
   }, [gapDetectionEnabled, settingsLocked]);
+
+  // ---- Three data-reduction filter toggles + steppers ----
+  //
+  // Each filter has an enabled toggle (persisted boolean) + a numeric
+  // parameter (persisted int / double). The steppers clamp to the same
+  // ranges as the native side (see GpsRecorderModule.kt) so the UI never
+  // shows a value the native side will reject. All are locked while a
+  // recording is in progress.
+
+  const handleToggleRadialDistanceFilter = useCallback(async () => {
+    if (settingsLocked) return;
+    const next = !radialDistanceFilterEnabled;
+    setRadialDistanceFilterEnabled(next);
+    try {
+      const confirmed = await GpsRecorder.setRadialDistanceFilterEnabled(next);
+      setRadialDistanceFilterEnabled(confirmed);
+    } catch (e: any) {
+      setRadialDistanceFilterEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [radialDistanceFilterEnabled, settingsLocked]);
+
+  const handleStepperRadialThreshold = useCallback(async (delta: number) => {
+    if (settingsLocked) return;
+    const next = Math.max(0, Math.min(1000, radialDistanceThresholdM + delta));
+    if (next === radialDistanceThresholdM) return;
+    setRadialDistanceThresholdM(next); // optimistic
+    try {
+      const confirmed = await GpsRecorder.setRadialDistanceThresholdM(next);
+      setRadialDistanceThresholdM(confirmed);
+    } catch (e: any) {
+      setRadialDistanceThresholdM(radialDistanceThresholdM); // revert
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [radialDistanceThresholdM, settingsLocked]);
+
+  const handleToggleTimeSampling = useCallback(async () => {
+    if (settingsLocked) return;
+    const next = !timeSamplingEnabled;
+    setTimeSamplingEnabled(next);
+    try {
+      const confirmed = await GpsRecorder.setTimeSamplingEnabled(next);
+      setTimeSamplingEnabled(confirmed);
+    } catch (e: any) {
+      setTimeSamplingEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [timeSamplingEnabled, settingsLocked]);
+
+  const handleStepperTimeSamplingN = useCallback(async (delta: number) => {
+    if (settingsLocked) return;
+    const next = Math.max(1, Math.min(60, timeSamplingN + delta));
+    if (next === timeSamplingN) return;
+    setTimeSamplingN(next);
+    try {
+      const confirmed = await GpsRecorder.setTimeSamplingN(next);
+      setTimeSamplingN(confirmed);
+    } catch (e: any) {
+      setTimeSamplingN(timeSamplingN);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [timeSamplingN, settingsLocked]);
+
+  const handleToggleDouglasPeucker = useCallback(async () => {
+    if (settingsLocked) return;
+    const next = !douglasPeuckerEnabled;
+    setDouglasPeuckerEnabled(next);
+    try {
+      const confirmed = await GpsRecorder.setDouglasPeuckerEnabled(next);
+      setDouglasPeuckerEnabled(confirmed);
+    } catch (e: any) {
+      setDouglasPeuckerEnabled(!next);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [douglasPeuckerEnabled, settingsLocked]);
+
+  const handleStepperDouglasPeuckerEpsilon = useCallback(async (delta: number) => {
+    if (settingsLocked) return;
+    const next = Math.max(0, Math.min(500, douglasPeuckerEpsilonM + delta));
+    if (next === douglasPeuckerEpsilonM) return;
+    setDouglasPeuckerEpsilonM(next);
+    try {
+      const confirmed = await GpsRecorder.setDouglasPeuckerEpsilonM(next);
+      setDouglasPeuckerEpsilonM(confirmed);
+    } catch (e: any) {
+      setDouglasPeuckerEpsilonM(douglasPeuckerEpsilonM);
+      setErrorMsg(e?.message ?? String(e));
+    }
+  }, [douglasPeuckerEpsilonM, settingsLocked]);
 
   const distanceFmt = formatDistance(distance);
   // Smoothed current pace: average of the last few GPS speeds. This is much
@@ -882,6 +1004,164 @@ function App(): React.ReactElement {
           </View>
         </Pressable>
 
+        {/* ---- Three data-reduction filters (user-requested) ---- */}
+        {/*
+          Each filter is an independent toggle with a numeric parameter. All
+          are locked while a recording is in progress (settingsLocked), so
+          the user can only change them between recordings — same rule as the
+          other toggles above. The stepper row is always visible (so the user
+          can preview / configure the parameter before enabling the filter),
+          but its −/+ buttons are disabled when the toggle is off OR when
+          settings are locked.
+
+          1. Radial distance filter (on-the-fly): drop any fix closer than X
+             meters to the last kept point. Default X = 5 m.
+          2. Time sampling (on-the-fly): keep every N-th fix. Default N = 5
+             (≈ one fix every 5 s at 1 Hz).
+          3. Douglas-Peucker (post-processing): simplify the saved track by
+             dropping points whose perpendicular distance from the segment
+             line is < epsilon meters. Default epsilon = 5 m. Applied AFTER
+             Gaussian smoothing if both are on.
+        */}
+
+        {/* 1. Radial distance filter toggle + stepper */}
+        <View style={styles.settingGroup}>
+          <Pressable
+            style={[
+              styles.toggleRow,
+              styles.toggleRowGrouped,
+              radialDistanceFilterEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+              settingsLocked && styles.toggleRowLocked,
+            ]}
+            onPress={handleToggleRadialDistanceFilter}
+            disabled={settingsLocked}
+          >
+            <View style={styles.toggleLabelWrap}>
+              <Text style={styles.toggleTitle}>Радиальный фильтр (на лету)</Text>
+              <Text style={styles.toggleSubtitle}>
+                {radialDistanceFilterEnabled
+                  ? `Включён: точка пропускается, если она ближе ${radialDistanceThresholdM} м к последней сохранённой`
+                  : 'Выключен: каждая принятая точка сохраняется в трек'}
+              </Text>
+            </View>
+            <View
+              style={[
+                styles.toggleSwitch,
+                radialDistanceFilterEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              ]}
+            >
+              <View
+                style={[
+                  styles.toggleKnob,
+                  radialDistanceFilterEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+                ]}
+              />
+            </View>
+          </Pressable>
+          <StepperRow
+            label="Мин. расстояние"
+            value={radialDistanceThresholdM}
+            unit="м"
+            min={0}
+            max={1000}
+            disabled={settingsLocked}
+            onDecrement={() => handleStepperRadialThreshold(-1)}
+            onIncrement={() => handleStepperRadialThreshold(+1)}
+          />
+        </View>
+
+        {/* 2. Time sampling filter toggle + stepper */}
+        <View style={styles.settingGroup}>
+          <Pressable
+            style={[
+              styles.toggleRow,
+              styles.toggleRowGrouped,
+              timeSamplingEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+              settingsLocked && styles.toggleRowLocked,
+            ]}
+            onPress={handleToggleTimeSampling}
+            disabled={settingsLocked}
+          >
+            <View style={styles.toggleLabelWrap}>
+              <Text style={styles.toggleTitle}>Децимация по времени (на лету)</Text>
+              <Text style={styles.toggleSubtitle}>
+                {timeSamplingEnabled
+                  ? `Включена: сохраняется каждая ${timeSamplingN}-я точка (≈ раз в ${timeSamplingN} с при 1 Гц)`
+                  : 'Выключена: сохраняются все принятые точки'}
+              </Text>
+            </View>
+            <View
+              style={[
+                styles.toggleSwitch,
+                timeSamplingEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              ]}
+            >
+              <View
+                style={[
+                  styles.toggleKnob,
+                  timeSamplingEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+                ]}
+              />
+            </View>
+          </Pressable>
+          <StepperRow
+            label="Шаг N"
+            value={timeSamplingN}
+            unit={timeSamplingN === 1 ? 'точка' : 'точек'}
+            min={1}
+            max={60}
+            disabled={settingsLocked}
+            onDecrement={() => handleStepperTimeSamplingN(-1)}
+            onIncrement={() => handleStepperTimeSamplingN(+1)}
+          />
+        </View>
+
+        {/* 3. Douglas-Peucker post-processing toggle + stepper */}
+        <View style={styles.settingGroup}>
+          <Pressable
+            style={[
+              styles.toggleRow,
+              styles.toggleRowGrouped,
+              douglasPeuckerEnabled ? styles.toggleRowOn : styles.toggleRowOff,
+              settingsLocked && styles.toggleRowLocked,
+            ]}
+            onPress={handleToggleDouglasPeucker}
+            disabled={settingsLocked}
+          >
+            <View style={styles.toggleLabelWrap}>
+              <Text style={styles.toggleTitle}>Douglas-Peucker (постобработка)</Text>
+              <Text style={styles.toggleSubtitle}>
+                {douglasPeuckerEnabled
+                  ? `Включён: трек упрощается, точки ближе ${douglasPeuckerEpsilonM} м от линии сегмента удаляются`
+                  : 'Выключен: GPX сохраняется как есть, без финального упрощения'}
+              </Text>
+            </View>
+            <View
+              style={[
+                styles.toggleSwitch,
+                douglasPeuckerEnabled ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+              ]}
+            >
+              <View
+                style={[
+                  styles.toggleKnob,
+                  douglasPeuckerEnabled ? styles.toggleKnobOn : styles.toggleKnobOff,
+                ]}
+              />
+            </View>
+          </Pressable>
+          <StepperRow
+            label="Эпсилон (допуск)"
+            value={douglasPeuckerEpsilonM}
+            unit="м"
+            min={0}
+            max={500}
+            disabled={settingsLocked}
+            onDecrement={() => handleStepperDouglasPeuckerEpsilon(-1)}
+            onIncrement={() => handleStepperDouglasPeuckerEpsilon(+1)}
+          />
+        </View>
+
         {!hasPermissions && (
           <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
             <Text style={styles.permissionButtonText}>
@@ -972,6 +1252,71 @@ function BigStat({
 
 function Divider(): React.ReactElement {
   return <View style={styles.divider} />;
+}
+
+/**
+ * Numeric stepper row: a small label, the current value with its unit, and
+ * a minus / plus button pair. Used by the three data-reduction filter
+ * settings (radial distance threshold, time sampling N, Douglas-Peucker
+ * epsilon) to expose the user-tunable parameter.
+ *
+ * The row is always visible (even when the parent toggle is off) so the
+ * user can preview / configure the parameter before enabling the filter.
+ * The −/+ buttons are disabled when `disabled` is true (recording in
+ * progress) OR when the value is at the min / max.
+ *
+ * Visually merges with the toggle row above it: shares the same horizontal
+ * padding + border + background, has no top border-radius, and a slightly
+ * smaller vertical padding so the two rows read as one "setting card".
+ */
+function StepperRow({
+  label,
+  value,
+  unit,
+  min,
+  max,
+  disabled,
+  onDecrement,
+  onIncrement,
+}: {
+  label: string;
+  value: number;
+  unit: string;
+  min: number;
+  max: number;
+  disabled: boolean;
+  onDecrement: () => void;
+  onIncrement: () => void;
+}): React.ReactElement {
+  const canDec = !disabled && value > min;
+  const canInc = !disabled && value < max;
+  return (
+    <View style={[styles.stepperRow, disabled && styles.toggleRowLocked]}>
+      <Pressable
+        style={[styles.stepperBtn, !canDec && styles.stepperBtnDisabled]}
+        onPress={onDecrement}
+        disabled={!canDec}
+        hitSlop={8}
+      >
+        <Text style={[styles.stepperBtnText, !canDec && styles.stepperBtnTextDisabled]}>−</Text>
+      </Pressable>
+      <View style={styles.stepperValueWrap}>
+        <Text style={styles.stepperLabel}>{label}</Text>
+        <Text style={styles.stepperValue}>
+          {value}
+          <Text style={styles.stepperUnit}> {unit}</Text>
+        </Text>
+      </View>
+      <Pressable
+        style={[styles.stepperBtn, !canInc && styles.stepperBtnDisabled]}
+        onPress={onIncrement}
+        disabled={!canInc}
+        hitSlop={8}
+      >
+        <Text style={[styles.stepperBtnText, !canInc && styles.stepperBtnTextDisabled]}>+</Text>
+      </Pressable>
+    </View>
+  );
 }
 
 /**
@@ -1187,6 +1532,15 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginBottom: 16,
   },
+  // Variant for toggle rows that are the TOP half of a settingGroup (toggle
+  // + stepper card). Removes the bottom margin and rounds only the top
+  // corners so the stepper row below visually attaches to it.
+  toggleRowGrouped: {
+    marginBottom: 0,
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0,
+    borderBottomWidth: 0,
+  },
   toggleRowOn: {
     backgroundColor: '#EFF6FF',
     borderColor: '#BFDBFE',
@@ -1239,6 +1593,79 @@ const styles = StyleSheet.create({
   },
   toggleKnobOn: { alignSelf: 'flex-end' },
   toggleKnobOff: { alignSelf: 'flex-start' },
+  // ---- Setting group (toggle + stepper card) ----
+  // Wraps a toggle row + stepper row so they read as one "card". The
+  // marginBottom here replaces the per-row marginBottom (which is removed
+  // by toggleRowGrouped on the top row, and absent on StepperRow).
+  settingGroup: {
+    marginBottom: 16,
+  },
+  // ---- Stepper row (numeric parameter for the data-reduction filters) ----
+  // Visually attaches to the toggle row above it: same horizontal padding,
+  // same border, same background colour family (so when the toggle is on
+  // the stepper inherits the light-blue tint), rounds only the BOTTOM
+  // corners, no top border (the toggle row already drew it).
+  stepperRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomLeftRadius: 12,
+    borderBottomRightRadius: 12,
+    borderWidth: 1,
+    borderTopWidth: 0,
+    backgroundColor: '#F9FAFB',
+    borderColor: COLOR.divider,
+  },
+  stepperBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: COLOR.divider,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepperBtnDisabled: {
+    backgroundColor: '#F3F4F6',
+    borderColor: '#E5E7EB',
+  },
+  stepperBtnText: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: COLOR.primary,
+    lineHeight: 24,
+    textAlign: 'center',
+  },
+  stepperBtnTextDisabled: {
+    color: '#9CA3AF',
+  },
+  stepperValueWrap: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  stepperLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: COLOR.secondary,
+    letterSpacing: 1.5,
+    marginBottom: 2,
+  },
+  stepperValue: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: COLOR.primary,
+    fontVariant: ['tabular-nums'],
+  },
+  stepperUnit: {
+    fontSize: 13,
+    fontWeight: '500',
+    color: COLOR.secondary,
+  },
   // ---- Settings section header + locked badge ----
   settingsHeader: {
     flexDirection: 'row',
