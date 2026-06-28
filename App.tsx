@@ -208,9 +208,14 @@ function App(): React.ReactElement {
   const movingMsRef = useRef<number>(0);
   const elapsedMsRef = useRef<number>(0);
   const autoPauseEnabledRef = useRef<boolean>(false);
+  // Bugfix: mirror gapDetectionEnabled too, so the saved-card pace logic
+  // can read it from the (once-set-up) saved-event closure. See the
+  // paceTimeMs comment above for why gap detection now also affects pace.
+  const gapDetectionEnabledRef = useRef<boolean>(true);
   useEffect(() => { movingMsRef.current = movingMs; }, [movingMs]);
   useEffect(() => { elapsedMsRef.current = elapsedMs; }, [elapsedMs]);
   useEffect(() => { autoPauseEnabledRef.current = autoPauseEnabled; }, [autoPauseEnabled]);
+  useEffect(() => { gapDetectionEnabledRef.current = gapDetectionEnabled; }, [gapDetectionEnabled]);
 
   // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
   const syncStateFromNative = useCallback(async () => {
@@ -588,11 +593,23 @@ function App(): React.ReactElement {
     return currentSpeed;
   })();
   const currentPace = computeCurrentPace(smoothedSpeed);
-  // Phase 6: when auto-pause is enabled, compute average pace using the
-  // active moving time (which excludes paused intervals) instead of wall-
+  // Phase 6 + bugfix: when auto-pause is enabled, compute average pace using
+  // the active moving time (which excludes paused intervals) instead of wall-
   // clock elapsed time. This keeps the displayed avg pace honest when the
   // user stands still for long stretches (e.g. at traffic lights).
-  const paceTimeMs = autoPauseEnabled ? movingMs : elapsedMs;
+  //
+  // Bugfix: also use movingMs when gap detection is enabled but auto-pause
+  // is off. In that case movingMs excludes signal-loss intervals (the
+  // watchdog freezes it when signalLost fires, see GpsRecorderService), so
+  // the avg pace stays honest across tunnels / indoor stretches where the
+  // GPS drops out. Without this, a 5-minute tunnel would inflate the avg
+  // pace from e.g. 5:30/km to 6:30/km because elapsedMs kept ticking
+  // through the outage while distance did not.
+  //
+  // When BOTH settings are off, movingMs equals elapsedMs (no transitions
+  // ever fire), so we use elapsedMs directly to avoid the small overhead
+  // of the movingMs path.
+  const paceTimeMs = (autoPauseEnabled || gapDetectionEnabled) ? movingMs : elapsedMs;
   const avgPace = computeAvgPace(paceTimeMs, distance);
 
   return (
@@ -879,7 +896,10 @@ function App(): React.ReactElement {
             <Text style={styles.savedPath}>{lastSavedPath}</Text>
             {lastSavedDistance != null && (() => {
               const fmt = formatDistance(lastSavedDistance);
-              const tMs = autoPauseEnabledRef.current
+              // Bugfix: keep the saved-card pace consistent with the live
+              // pace logic — use movingMs whenever auto-pause OR gap
+              // detection was enabled at save time.
+              const tMs = (autoPauseEnabledRef.current || gapDetectionEnabledRef.current)
                 ? lastSavedMovingMs
                 : lastSavedElapsedMs;
               const pace = computeAvgPace(tMs, lastSavedDistance);
