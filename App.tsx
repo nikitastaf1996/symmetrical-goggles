@@ -263,10 +263,14 @@ function App(): React.ReactElement {
   // torn down + recreated on every idle -> recording -> stopping -> idle
   // transition, which was causing missed 'state' / 'saved' events). The
   // closures read this ref instead of capturing the state directly.
+  // U18: recordingStateRef is updated SYNCHRONOUSLY inside handleStart /
+  // handleStop (NOT via useEffect). The previous useEffect-based approach
+  // had a race window: between setRecordingState('recording') running and
+  // the useEffect firing on the next render, a 'gnss' event could arrive
+  // and the handler would read the STALE ref value ('idle') — overriding
+  // currentSpeed with the gnss speed even though we just started recording.
+  // Synchronous ref updates close that race entirely.
   const recordingStateRef = useRef<RecordingState>('idle');
-  useEffect(() => {
-    recordingStateRef.current = recordingState;
-  }, [recordingState]);
 
   // Sliding window of the most recent GPS speeds (m/s) seen during the
   // current recording. Used to compute a smoothed "current pace" instead of
@@ -323,7 +327,13 @@ function App(): React.ReactElement {
     try {
       const state: GpsFullState = await GpsRecorder.getState();
       if (state.isRecording) {
-        setRecordingState((prev) => (prev === 'stopping' ? prev : 'recording'));
+        // U18: update recordingStateRef synchronously alongside the state
+        // setter so the 'gnss' / 'location' handlers read the right value.
+        setRecordingState((prev) => {
+          const next = prev === 'stopping' ? prev : 'recording';
+          recordingStateRef.current = next;
+          return next;
+        });
         // U8: setPointCount(state.pointCount) removed — unused state.
         // L24 fix: don't let a getState() poll overwrite elapsedMs with an
         // older value. The duration tick (1 Hz) is the authoritative source
@@ -343,7 +353,11 @@ function App(): React.ReactElement {
         }
         // U13: startTimeRef assignment removed — dead code.
       } else {
-        setRecordingState((prev) => (prev === 'stopping' ? prev : 'idle'));
+        setRecordingState((prev) => {
+          const next = prev === 'stopping' ? prev : 'idle';
+          recordingStateRef.current = next;
+          return next;
+        });
       }
     } catch {
       // ignore — will retry on next poll
@@ -510,6 +524,8 @@ function App(): React.ReactElement {
       }),
       subscribe('state', (ev: GpsStateEvent) => {
         if (ev.isRecording) {
+          // U18: update ref synchronously.
+          recordingStateRef.current = 'recording';
           setRecordingState('recording');
           // U8: setPointCount(ev.pointCount) removed — unused state.
           setElapsedMs(ev.elapsedMs);
@@ -520,6 +536,8 @@ function App(): React.ReactElement {
           if (typeof ev.signalLost === 'boolean') setSignalLost(ev.signalLost);
           if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
         } else {
+          // U18: update ref synchronously.
+          recordingStateRef.current = 'idle';
           setRecordingState('idle');
           // U8: setPointCount(0) removed — unused state.
           setElapsedMs(0);
@@ -573,6 +591,8 @@ function App(): React.ReactElement {
         setCurrentSpeed(null);
         setFixType('no fix');
         setHasFix(false);
+        // U18: update ref synchronously.
+        recordingStateRef.current = 'idle';
         setRecordingState('idle');
         // Phase 1/3/4: clear live pause / signal / moving-time after save.
         setIsAutoPaused(false);
@@ -599,6 +619,8 @@ function App(): React.ReactElement {
         // normally — the user sees the error message AND the saved card.
         setErrorMsg(ev.message);
         if (ev.fatal) {
+          // U18: update ref synchronously.
+          recordingStateRef.current = 'idle';
           setRecordingState('idle');
         }
       }),
@@ -715,11 +737,18 @@ function App(): React.ReactElement {
       recentSpeedsRef.current = [];
 
       await GpsRecorder.start();
+      // U18: update recordingStateRef SYNCHRONOUSLY before setRecordingState
+      // so the 'gnss' event handler (which reads the ref) sees 'recording'
+      // immediately. Otherwise the ref would lag behind state by one render
+      // and a 'gnss' event arriving in that window could override
+      // currentSpeed despite us just having started recording.
+      recordingStateRef.current = 'recording';
       setRecordingState('recording');
       syncStateFromNative();
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setErrorMsg(msg);
+      recordingStateRef.current = 'idle';
       setRecordingState('idle');
     }
   }, [syncStateFromNative]);
@@ -749,6 +778,8 @@ function App(): React.ReactElement {
 
   const handleStop = useCallback(async () => {
     setErrorMsg(null);
+    // U18: update recordingStateRef SYNCHRONOUSLY before setRecordingState.
+    recordingStateRef.current = 'stopping';
     setRecordingState('stopping');
     try {
       await GpsRecorder.stop();
@@ -762,6 +793,8 @@ function App(): React.ReactElement {
       }, 1000) as unknown as number;
     } catch (e: unknown) {
       setErrorMsg(e instanceof Error ? e.message : String(e));
+      // Revert to 'recording' so the user can try STOP again.
+      recordingStateRef.current = 'recording';
       setRecordingState('recording');
     }
   }, [syncStateFromNative]);
