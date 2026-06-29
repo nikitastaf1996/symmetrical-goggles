@@ -566,12 +566,15 @@ function App(): React.ReactElement {
     const appStateSub = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
         syncStateFromNative();
+        // U6: add .catch() so an unhandled promise rejection doesn't fire
+        // if hasPermissions() throws (e.g. native module not yet ready on
+        // very first foreground event during cold start).
         GpsRecorder.hasPermissions().then(async (g) => {
           setHasPermissions(g);
           if (g) {
             try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
           }
-        });
+        }).catch(() => { /* permission check failed, will retry on next AppState change */ });
       }
     });
 
@@ -585,8 +588,11 @@ function App(): React.ReactElement {
       subs.forEach((s) => s.remove());
       appStateSub.remove();
       clearInterval(pollInterval);
-      // Stop the GNSS monitor when the JS app unmounts.
-      try { GpsRecorder.stopGnssMonitor(); } catch { /* ignore */ }
+      // U6: stopGnssMonitor() returns a Promise — wrapping it in a
+      // try/catch would NOT catch an async rejection. Use .catch() so an
+      // unhandled promise rejection doesn't fire if the native module
+      // rejects during teardown.
+      GpsRecorder.stopGnssMonitor().catch(() => { /* ignore */ });
     };
   }, [syncStateFromNative]); // NOTE: recordingState intentionally omitted — see recordingStateRef.
 
