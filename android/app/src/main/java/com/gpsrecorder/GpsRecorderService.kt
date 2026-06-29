@@ -98,6 +98,16 @@ class GpsRecorderService : Service(), LocationListener {
         private const val KEY_LAST_ACCURACY = "last_accuracy"
         private const val KEY_LAST_TIME_MS = "last_time_ms"
 
+        // L13 fix: MediaStore URI of the most recently saved GPX file (as a
+        // string). Populated by saveViaMediaStore() on API 29+ so that
+        // recomputeDistanceFromSavedGpx() can open the file via ContentResolver
+        // instead of trying to resolve the MediaStore-relative path through
+        // Environment.getExternalStoragePublicDirectory() (which on scoped
+        // storage points to a different directory than the MediaStore-scoped
+        // Downloads — file.exists() returns false even though the file was
+        // just written).
+        private const val KEY_LAST_SAVED_URI = "last_saved_uri"
+
         // GPS request parameters
         private const val MIN_TIME_MS = 1000L          // 1 second
         private const val MIN_DISTANCE_M = 1.0f         // 1 meter
@@ -1534,38 +1544,57 @@ class GpsRecorderService : Service(), LocationListener {
      * legacy absolute path, or a "Cache fallback: ..." / "Save failed: ..."
      * message. We only attempt to open it as a real file when it looks like
      * a path; otherwise we return -1.0.
+     *
+     * L13 fix: on API 29+ (scoped storage), the MediaStore-relative path
+     * CANNOT be resolved via Environment.getExternalStoragePublicDirectory()
+     * — the public Downloads directory accessed via Environment is not the
+     * same as the MediaStore-scoped Downloads. The file.exists() check used
+     * to return false even though the file was just written, causing
+     * finalDistanceM to fall back to -1.0 and the UI to show the live-
+     * accumulated distance instead of the post-smoothing true length.
+     *
+     * We now read the MediaStore URI (persisted by [saveViaMediaStore] under
+     * KEY_LAST_SAVED_URI) and open the file via contentResolver.openInputStream.
+     * The legacy File fallback is kept for API < 29.
      */
     private fun recomputeDistanceFromSavedGpx(savedPath: String): Double {
         try {
-            val file: File? = when {
-                savedPath.startsWith("Downloads/trck/") -> {
-                    // MediaStore path on API >= 29. The file lives under the
-                    // user's Downloads directory; resolve via Environment.
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        // We can't easily resolve MediaStore URIs back to a
-                        // File without a query; fall back to the public
-                        // Downloads directory + the relative tail.
-                        val downloads = Environment.getExternalStoragePublicDirectory(
-                            Environment.DIRECTORY_DOWNLOADS
-                        )
-                        File(downloads, "trck/${savedPath.removePrefix("Downloads/trck/")}")
-                    } else {
+            // L13 fix: prefer the persisted MediaStore URI on API 29+.
+            val savedUriStr = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_LAST_SAVED_URI, null)
+            val text: String = if (savedUriStr != null) {
+                try {
+                    val uri = android.net.Uri.parse(savedUriStr)
+                    contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?.toString(Charsets.UTF_8)
+                        ?: run {
+                            Log.w(TAG, "recomputeDistanceFromSavedGpx: openInputStream returned null for $savedUriStr")
+                            return -1.0
+                        }
+                } catch (e: Exception) {
+                    Log.w(TAG, "recomputeDistanceFromSavedGpx: failed to open URI $savedUriStr", e)
+                    return -1.0
+                }
+            } else {
+                // Legacy File fallback (API < 29) or path-based resolution.
+                val file: File? = when {
+                    savedPath.startsWith("Downloads/trck/") -> {
                         val downloads = Environment.getExternalStoragePublicDirectory(
                             Environment.DIRECTORY_DOWNLOADS
                         )
                         File(downloads, "trck/${savedPath.removePrefix("Downloads/trck/")}")
                     }
+                    savedPath.startsWith("/") -> File(savedPath)
+                    savedPath.startsWith("Cache fallback: ") ->
+                        File(savedPath.removePrefix("Cache fallback: "))
+                    else -> null
                 }
-                savedPath.startsWith("/") -> File(savedPath)
-                savedPath.startsWith("Cache fallback: ") ->
-                    File(savedPath.removePrefix("Cache fallback: "))
-                else -> null
+                if (file == null || !file.exists()) {
+                    Log.w(TAG, "recomputeDistanceFromSavedGpx: cannot resolve path '$savedPath'")
+                    return -1.0
+                }
+                file.readText(Charsets.UTF_8)
             }
-            if (file == null || !file.exists()) {
-                Log.w(TAG, "recomputeDistanceFromSavedGpx: cannot resolve path '$savedPath'")
-                return -1.0
-            }
-            val text = file.readText(Charsets.UTF_8)
             // Parse each <trkseg> independently and sum intra-segment
             // distances. Inter-segment jumps (across pauses / gaps) are NOT
             // counted — they're not real movement.
@@ -1593,7 +1622,7 @@ class GpsRecorderService : Service(), LocationListener {
                     prevLon = lon
                 }
             }
-            Log.i(TAG, "recomputeDistanceFromSavedGpx: parsed=$parsed total=${total}m from $savedPath")
+            Log.i(TAG, "recomputeDistanceFromSavedGpx: parsed=$parsed total=${total}m from $savedPath (uri=${savedUriStr != null})")
             return total
         } catch (e: Exception) {
             // L10 fix: non-fatal error. The recording has already been saved
@@ -2076,6 +2105,20 @@ class GpsRecorderService : Service(), LocationListener {
                 val done = android.content.ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
                 resolver.update(uri, done, null, null)
             }
+        }
+        // L13 fix: persist the MediaStore URI to SharedPreferences so
+        // recomputeDistanceFromSavedGpx() can open the file via ContentResolver
+        // instead of trying to resolve the MediaStore-relative path through
+        // Environment.getExternalStoragePublicDirectory() (which on scoped
+        // storage points to a different directory than the MediaStore-scoped
+        // Downloads — file.exists() returns false even though we just wrote
+        // the file).
+        try {
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putString(KEY_LAST_SAVED_URI, uri.toString())
+                .apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to persist last_saved_uri", e)
         }
         return "Downloads/trck/$fileName"
     }
