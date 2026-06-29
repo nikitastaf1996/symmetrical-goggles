@@ -249,6 +249,15 @@ function App(): React.ReactElement {
   // the await resolves we know to bail out instead of proceeding to start.
   const [waitingForPermissions, setWaitingForPermissions] = useState<boolean>(false);
   const cancelPermissionWaitRef = useRef<boolean>(false);
+  // U12: track whether we've already asked the user about battery-optim
+  // exemption (so we don't pop the system dialog on every START) and
+  // whether they denied it (so we can show a warning banner). The ref
+  // survives the component's lifetime; if the app is killed and
+  // relaunched, the user will see the dialog once more (acceptable — the
+  // alternative would require persisting the flag via native prefs, which
+  // is out of scope for the JS-only TODO-3 set).
+  const hasAskedBatteryOptRef = useRef<boolean>(false);
+  const [batteryOptDenied, setBatteryOptDenied] = useState<boolean>(false);
   // U18: mirror of `recordingState` for use inside event-subscription closures.
   // We keep the main useEffect's deps stable (so the subscriptions are NOT
   // torn down + recreated on every idle -> recording -> stopping -> idle
@@ -646,10 +655,18 @@ function App(): React.ReactElement {
         return;
       }
 
-      try {
-        await GpsRecorder.requestIgnoreBatteryOptimizations();
-      } catch {
-        // ignore
+      // U12: only show the battery-optimization system dialog ONCE per app
+      // session. If the user denied it, a warning banner is shown above
+      // the START button (rendered below) with a tap action that re-opens
+      // the dialog manually.
+      if (!hasAskedBatteryOptRef.current) {
+        hasAskedBatteryOptRef.current = true;
+        try {
+          const batteryGranted = await GpsRecorder.requestIgnoreBatteryOptimizations();
+          setBatteryOptDenied(!batteryGranted);
+        } catch {
+          setBatteryOptDenied(true);
+        }
       }
 
       setElapsedMs(0);
@@ -681,6 +698,20 @@ function App(): React.ReactElement {
   const handleCancelPermissionWait = useCallback(() => {
     cancelPermissionWaitRef.current = true;
     setWaitingForPermissions(false);
+  }, []);
+
+  // U12: manual retry for the battery-optimization exemption. Tapping the
+  // warning banner re-opens the system dialog. We don't reset
+  // hasAskedBatteryOptRef here — that would let a subsequent handleStart
+  // auto-prompt again, which we explicitly don't want. This is purely a
+  // manual retry path.
+  const handleRetryBatteryOpt = useCallback(async () => {
+    try {
+      const granted = await GpsRecorder.requestIgnoreBatteryOptimizations();
+      setBatteryOptDenied(!granted);
+    } catch {
+      setBatteryOptDenied(true);
+    }
   }, []);
 
   const handleStop = useCallback(async () => {
@@ -1017,6 +1048,18 @@ function App(): React.ReactElement {
               : 'ОЖИДАНИЕ'}
           </Text>
         </View>
+
+        {/* U12: non-blocking warning banner shown above the START button when
+            the user previously denied the battery-optimization exemption.
+            Doze mode may kill the foreground service during long background
+            recordings. Tap to re-open the system dialog. */}
+        {batteryOptDenied && !isRecording && !isStopping && (
+          <Pressable style={styles.batteryOptBanner} onPress={handleRetryBatteryOpt}>
+            <Text style={styles.batteryOptBannerText}>
+              ⚠️ Фоновые записи могут прерываться (Doze). Нажмите здесь, чтобы настроить.
+            </Text>
+          </Pressable>
+        )}
 
         {/* Big circular START / STOP button */}
         <View style={styles.buttonWrap}>
@@ -1735,6 +1778,24 @@ const styles = StyleSheet.create({
   },
   // ---- Big button ----
   buttonWrap: { alignItems: 'center', marginTop: 24, marginBottom: 16 },
+  // U12: battery-optimization warning banner.
+  batteryOptBanner: {
+    backgroundColor: COLOR.pauseBg,
+    borderWidth: 1,
+    borderColor: COLOR.pauseBorder,
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 12,
+    marginTop: 4,
+  },
+  batteryOptBannerText: {
+    color: COLOR.pauseAccent,
+    fontSize: 12,
+    fontWeight: '600',
+    lineHeight: 16,
+    textAlign: 'center',
+  },
   bigButton: {
     width: 220, height: 220, borderRadius: 110,
     alignItems: 'center', justifyContent: 'center',
