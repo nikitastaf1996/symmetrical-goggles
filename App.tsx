@@ -1631,6 +1631,23 @@ function App(): React.ReactElement {
           </View>
         </View>
       )}
+
+      {/* U20: stop/save overlay. Shown while recordingState === 'stopping' so
+          the user knows the finalize step is in progress (Gaussian smoothing
+          + Douglas-Peucker on a long track can take several seconds). The
+          overlay is non-blocking visually but covers the UI; it disappears
+          when recordingState transitions to 'idle' (i.e. when the 'saved'
+          event arrives). */}
+      {isStopping && (
+        <View style={styles.permissionWaitOverlay}>
+          <View style={styles.permissionWaitCard}>
+            <ActivityIndicator size="large" color={COLOR.accentStop} />
+            <Text style={styles.permissionWaitText}>
+              Сохранение GPX…
+            </Text>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
