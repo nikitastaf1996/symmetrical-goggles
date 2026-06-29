@@ -7,7 +7,7 @@ APK binary is checked into the repo (which is normally an anti-pattern).
 ## What this project is
 
 `GpsRecorder` is a small **React Native** Android app that records GPS tracks in
-the background and writes them to the public `Downloads/GpsRecorder/` folder as
+the background and writes them to the public `Downloads/trck/` folder as
 `.gpx` files.
 
 Key features:
@@ -16,7 +16,7 @@ Key features:
 - A duration display (`mm:ss` or `h:mm:ss`) that ticks every second.
 - A persistent **foreground-service notification** with a **Stop** action so the
   user can stop the recording without opening the app.
-- GPS fixes are saved as a GPX 1.1 file under `Downloads/GpsRecorder/`.
+- GPS fixes are saved as a GPX 1.1 file under `Downloads/trck/`.
 - Recording survives:
   - The app being backgrounded.
   - The app being swiped away from the recents list.
