@@ -1219,6 +1219,7 @@ class GpsRecorderService : Service(), LocationListener {
             // pause resume / gap recovery), so this gate is naturally bypassed
             // for the first fix after such a transition — exactly what we want,
             // since that fix has no meaningful "previous" to compare against.
+            var distanceToAdd = 0.0
             val pLat = prevLat
             val pLon = prevLon
             val pTime = prevTimeMs
@@ -1234,7 +1235,7 @@ class GpsRecorderService : Service(), LocationListener {
                     Log.d(TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
                     return
                 }
-                totalDistanceM += d
+                distanceToAdd = d
                 // ---- Radial-distance on-the-fly filter (independent toggle) ----
                 // Drops the candidate if it is closer than threshold meters to
                 // the last KEPT point (which is what prevLat/prevLon currently
@@ -1251,6 +1252,14 @@ class GpsRecorderService : Service(), LocationListener {
                 // still "fresh" (good GPS), so we update lastFixTimeMs +
                 // saveLiveState + emit before returning — same pattern as the
                 // time-sampling drop above.
+                //
+                // Bugfix: distanceToAdd is staged here but only committed to
+                // totalDistanceM *after* the radial filter check passes. The
+                // previous version did `totalDistanceM += d` before the radial
+                // check, so a dropped (too-close) fix would leak its step
+                // distance into the accumulator while prevLat/prevLon stayed
+                // put — the next accepted fix then re-computed distance from
+                // the same cursor, double-counting the dropped step.
                 if (isRadialDistanceFilterEnabled()) {
                     val threshold = getRadialDistanceThresholdM().toDouble()
                     if (d < threshold) {
@@ -1269,6 +1278,9 @@ class GpsRecorderService : Service(), LocationListener {
             }
             // D. Point passed both gates — commit it to the current segment and
             // advance the previous-fix cursor.
+            // Accumulate only after confirming the point passes the radial
+            // filter, so dropped fixes don't leak distance into totalDistanceM.
+            totalDistanceM += distanceToAdd
             appendPointToCurrentSegment(pt)
             prevLat = pt.lat
             prevLon = pt.lon
@@ -2401,7 +2413,15 @@ class GpsRecorderService : Service(), LocationListener {
         if (d13 == 0.0) return 0.0
         val theta13 = bearingRad(aLat, aLon, pLat, pLon)
         val theta12 = bearingRad(aLat, aLon, bLat, bLon)
-        val dXt = Math.asin(Math.sin(d13) * Math.sin(theta13 - theta12)) * r
+        // Clamp the asin argument to [-1.0, 1.0] to absorb floating-point
+        // drift. Math.sin(d13) * Math.sin(theta13 - theta12) can evaluate
+        // slightly outside the legal domain of asin when the point lies on
+        // (or numerically coincides with) the great-circle arc, which would
+        // otherwise make asin return NaN and poison the Douglas-Peucker
+        // recursion downstream.
+        val sinArg = Math.sin(d13) * Math.sin(theta13 - theta12)
+        val clampedArg = sinArg.coerceIn(-1.0, 1.0)
+        val dXt = Math.asin(clampedArg) * r
         return Math.abs(dXt)
     }
 
