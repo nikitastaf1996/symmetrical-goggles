@@ -241,7 +241,7 @@ function App(): React.ReactElement {
   const [isAutoPaused, setIsAutoPaused] = useState<boolean>(false);
   const [signalLost, setSignalLost] = useState<boolean>(false);
   const [movingMs, setMovingMs] = useState<number>(0);
-  const startTimeRef = useRef<number | null>(null);
+  // U13: startTimeRef removed — it was dead code (assigned but never read).
   // U1: while true, a full-screen spinner overlay with a "Отмена" button is
   // shown over the UI. Set just before awaiting requestPermissions() and
   // cleared as soon as the await resolves (whether granted or denied). The
@@ -336,9 +336,7 @@ function App(): React.ReactElement {
           setAccuracy(state.lastFix.accuracy);
           setCurrentSpeed(state.lastFix.speed);
         }
-        if (startTimeRef.current == null) {
-          startTimeRef.current = Date.now() - state.elapsedMs;
-        }
+        // U13: startTimeRef assignment removed — dead code.
       } else {
         setRecordingState((prev) => (prev === 'stopping' ? prev : 'idle'));
       }
@@ -496,9 +494,7 @@ function App(): React.ReactElement {
           lastDurationSeqRef.current = ev.seq;
         }
         setElapsedMs(ev.elapsedMs);
-        if (startTimeRef.current == null) {
-          startTimeRef.current = Date.now() - ev.elapsedMs;
-        }
+        // U13: startTimeRef assignment removed — dead code.
         // L8 fix: prefer the duration event's movingMs over the (stale)
         // location event's movingMs. The duration tick fires every second,
         // so the displayed avg pace no longer oscillates between the live
@@ -512,7 +508,7 @@ function App(): React.ReactElement {
           setRecordingState('recording');
           // U8: setPointCount(ev.pointCount) removed — unused state.
           setElapsedMs(ev.elapsedMs);
-          startTimeRef.current = Date.now() - ev.elapsedMs;
+          // U13: startTimeRef assignment removed — dead code.
           // Phase 1/3/4: sync live pause / signal / moving-time on state
           // transitions (e.g. when the watchdog fires or auto-pause toggles).
           if (typeof ev.isAutoPaused === 'boolean') setIsAutoPaused(ev.isAutoPaused);
@@ -530,7 +526,7 @@ function App(): React.ReactElement {
           setIsAutoPaused(false);
           setSignalLost(false);
           setMovingMs(0);
-          startTimeRef.current = null;
+          // U13: startTimeRef reset removed — dead code.
           // Clear the pace-smoothing window so a fresh recording starts
           // with no stale speeds from the previous run.
           recentSpeedsRef.current = [];
@@ -569,7 +565,7 @@ function App(): React.ReactElement {
         setIsAutoPaused(false);
         setSignalLost(false);
         setMovingMs(0);
-        startTimeRef.current = null;
+        // U13: startTimeRef reset removed — dead code.
         // Clear the pace-smoothing window for the next recording.
         recentSpeedsRef.current = [];
       }),
@@ -677,7 +673,7 @@ function App(): React.ReactElement {
       // U3: clear the save-time settings snapshot so the next recording's
       // saved card gets a fresh snapshot (not the previous run's toggles).
       setLastSavedSettings(null);
-      startTimeRef.current = Date.now();
+      // U13: startTimeRef assignment removed — dead code.
       // Clear the pace-smoothing window for the fresh recording.
       recentSpeedsRef.current = [];
 
