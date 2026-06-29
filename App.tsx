@@ -753,32 +753,47 @@ function App(): React.ReactElement {
   // toggling them mid-recording cannot change the filter / smoothing behaviour
   // halfway through the file.
   const settingsLocked = isRecording || isStopping;
+  // U15: re-entrancy guard for settings toggles. Without this, a second tap
+  // before the first await resolves would cause the first setX(confirmed)
+  // to overwrite the second optimistic update. Each toggle handler checks
+  // this ref at entry and bails out if a previous toggle is still in flight.
+  const settingsUpdatingRef = useRef<boolean>(false);
 
   const handleTogglePostProcess = useCallback(async () => {
     if (settingsLocked) return; // locked during recording
+    // U15: re-entrancy guard — a second tap before the first await resolves
+    // would race with the optimistic update.
+    if (settingsUpdatingRef.current) return;
+    settingsUpdatingRef.current = true;
     const next = !postProcessEnabled;
     setPostProcessEnabled(next); // optimistic UI update
     try {
       const confirmed = await GpsRecorder.setPostProcessEnabled(next);
       setPostProcessEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       // revert on failure
       setPostProcessEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [postProcessEnabled, settingsLocked]);
 
   const handleToggleGaussianSmoothing = useCallback(async () => {
     if (settingsLocked) return; // locked during recording
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = !gaussianSmoothingEnabled;
     setGaussianSmoothingEnabled(next); // optimistic UI update
     try {
       const confirmed = await GpsRecorder.setGaussianSmoothingEnabled(next);
       setGaussianSmoothingEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       // revert on failure
       setGaussianSmoothingEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [gaussianSmoothingEnabled, settingsLocked]);
 
@@ -789,14 +804,18 @@ function App(): React.ReactElement {
   // halfway through the file.
   const handleToggleAutoPause = useCallback(async () => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = !autoPauseEnabled;
     setAutoPauseEnabled(next);
     try {
       const confirmed = await GpsRecorder.setAutoPauseEnabled(next);
       setAutoPauseEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setAutoPauseEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [autoPauseEnabled, settingsLocked]);
 
@@ -806,14 +825,18 @@ function App(): React.ReactElement {
   // do NOT split the track and the signal-lost UI banner never appears.
   const handleToggleGapDetection = useCallback(async () => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = !gapDetectionEnabled;
     setGapDetectionEnabled(next);
     try {
       const confirmed = await GpsRecorder.setGapDetectionEnabled(next);
       setGapDetectionEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setGapDetectionEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [gapDetectionEnabled, settingsLocked]);
 
@@ -827,82 +850,115 @@ function App(): React.ReactElement {
 
   const handleToggleRadialDistanceFilter = useCallback(async () => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = !radialDistanceFilterEnabled;
     setRadialDistanceFilterEnabled(next);
     try {
       const confirmed = await GpsRecorder.setRadialDistanceFilterEnabled(next);
       setRadialDistanceFilterEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setRadialDistanceFilterEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [radialDistanceFilterEnabled, settingsLocked]);
 
   const handleStepperRadialThreshold = useCallback(async (delta: number) => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = Math.max(0, Math.min(1000, radialDistanceThresholdM + delta));
-    if (next === radialDistanceThresholdM) return;
+    if (next === radialDistanceThresholdM) {
+      settingsUpdatingRef.current = false;
+      return;
+    }
     setRadialDistanceThresholdM(next); // optimistic
     try {
       const confirmed = await GpsRecorder.setRadialDistanceThresholdM(next);
       setRadialDistanceThresholdM(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setRadialDistanceThresholdM(radialDistanceThresholdM); // revert
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [radialDistanceThresholdM, settingsLocked]);
 
   const handleToggleTimeSampling = useCallback(async () => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = !timeSamplingEnabled;
     setTimeSamplingEnabled(next);
     try {
       const confirmed = await GpsRecorder.setTimeSamplingEnabled(next);
       setTimeSamplingEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setTimeSamplingEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [timeSamplingEnabled, settingsLocked]);
 
   const handleStepperTimeSamplingN = useCallback(async (delta: number) => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = Math.max(1, Math.min(60, timeSamplingN + delta));
-    if (next === timeSamplingN) return;
+    if (next === timeSamplingN) {
+      settingsUpdatingRef.current = false;
+      return;
+    }
     setTimeSamplingN(next);
     try {
       const confirmed = await GpsRecorder.setTimeSamplingN(next);
       setTimeSamplingN(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setTimeSamplingN(timeSamplingN);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [timeSamplingN, settingsLocked]);
 
   const handleToggleDouglasPeucker = useCallback(async () => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = !douglasPeuckerEnabled;
     setDouglasPeuckerEnabled(next);
     try {
       const confirmed = await GpsRecorder.setDouglasPeuckerEnabled(next);
       setDouglasPeuckerEnabled(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setDouglasPeuckerEnabled(!next);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [douglasPeuckerEnabled, settingsLocked]);
 
   const handleStepperDouglasPeuckerEpsilon = useCallback(async (delta: number) => {
     if (settingsLocked) return;
+    if (settingsUpdatingRef.current) return; // U15
+    settingsUpdatingRef.current = true;
     const next = Math.max(0, Math.min(500, douglasPeuckerEpsilonM + delta));
-    if (next === douglasPeuckerEpsilonM) return;
+    if (next === douglasPeuckerEpsilonM) {
+      settingsUpdatingRef.current = false;
+      return;
+    }
     setDouglasPeuckerEpsilonM(next);
     try {
       const confirmed = await GpsRecorder.setDouglasPeuckerEpsilonM(next);
       setDouglasPeuckerEpsilonM(confirmed);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setDouglasPeuckerEpsilonM(douglasPeuckerEpsilonM);
-      setErrorMsg(e?.message ?? String(e));
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
     }
   }, [douglasPeuckerEpsilonM, settingsLocked]);
 
