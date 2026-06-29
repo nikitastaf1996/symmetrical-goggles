@@ -32,6 +32,7 @@
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
+  ActivityIndicator,
   AppState,
   Platform,
   Pressable,
@@ -194,7 +195,14 @@ function App(): React.ReactElement {
   const [signalLost, setSignalLost] = useState<boolean>(false);
   const [movingMs, setMovingMs] = useState<number>(0);
   const startTimeRef = useRef<number | null>(null);
-  // Mirror of `recordingState` for use inside event-subscription closures.
+  // U1: while true, a full-screen spinner overlay with a "Отмена" button is
+  // shown over the UI. Set just before awaiting requestPermissions() and
+  // cleared as soon as the await resolves (whether granted or denied). The
+  // cancel button sets `cancelPermissionWaitRef.current = true` so that when
+  // the await resolves we know to bail out instead of proceeding to start.
+  const [waitingForPermissions, setWaitingForPermissions] = useState<boolean>(false);
+  const cancelPermissionWaitRef = useRef<boolean>(false);
+  // U18: mirror of `recordingState` for use inside event-subscription closures.
   // We keep the main useEffect's deps stable (so the subscriptions are NOT
   // torn down + recreated on every idle -> recording -> stopping -> idle
   // transition, which was causing missed 'state' / 'saved' events). The
@@ -511,11 +519,23 @@ function App(): React.ReactElement {
     try {
       let granted = await GpsRecorder.hasPermissions();
       if (!granted) {
-        // L9 fix: requestPermissions() now resolves only after the user
-        // actually responds to the system dialog, so we no longer need the
-        // 30-second polling loop. The await below blocks until the user
-        // taps Allow or Deny.
-        granted = await GpsRecorder.requestPermissions();
+        // U1: show a spinner overlay with a Cancel button while the system
+        // permission dialog is on screen. requestPermissions() resolves
+        // only after the user taps Allow or Deny (L9 fix), so we just await
+        // it — no 30-second polling loop, no JS thread blocking. The cancel
+        // button lets the user bail out without waiting for the dialog.
+        cancelPermissionWaitRef.current = false;
+        setWaitingForPermissions(true);
+        try {
+          granted = await GpsRecorder.requestPermissions();
+        } finally {
+          setWaitingForPermissions(false);
+        }
+        // If the user pressed "Отмена" while the dialog was up, bail out
+        // without proceeding to startRecording — return to idle silently.
+        if (cancelPermissionWaitRef.current) {
+          return;
+        }
         setHasPermissions(granted);
         if (granted) {
           try { await GpsRecorder.startGnssMonitor(); } catch { /* ignore */ }
@@ -547,11 +567,21 @@ function App(): React.ReactElement {
       await GpsRecorder.start();
       setRecordingState('recording');
       syncStateFromNative();
-    } catch (e: any) {
-      setErrorMsg(e?.message ?? String(e));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setErrorMsg(msg);
       setRecordingState('idle');
     }
   }, [syncStateFromNative]);
+
+  // U1: cancel handler for the permission-wait overlay. Just sets a flag —
+  // when requestPermissions() eventually resolves, handleStart checks the
+  // flag and returns to idle without proceeding. (We can't actually abort
+  // the native permission request, but we can ignore its result.)
+  const handleCancelPermissionWait = useCallback(() => {
+    cancelPermissionWaitRef.current = true;
+    setWaitingForPermissions(false);
+  }, []);
 
   const handleStop = useCallback(async () => {
     setErrorMsg(null);
@@ -1246,6 +1276,26 @@ function App(): React.ReactElement {
           </Text>
         </View>
       </ScrollView>
+
+      {/* U1: permission-wait overlay. Shown while the system permission dialog
+          is on screen so the user knows the START tap was registered and can
+          cancel out of the wait. Non-blocking visually but covers the UI. */}
+      {waitingForPermissions && (
+        <View style={styles.permissionWaitOverlay}>
+          <View style={styles.permissionWaitCard}>
+            <ActivityIndicator size="large" color={COLOR.primary} />
+            <Text style={styles.permissionWaitText}>
+              Ожидание разрешений…
+            </Text>
+            <Pressable
+              style={styles.permissionWaitCancelBtn}
+              onPress={handleCancelPermissionWait}
+            >
+              <Text style={styles.permissionWaitCancelText}>Отмена</Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -1768,6 +1818,49 @@ const styles = StyleSheet.create({
   footerNote: { marginTop: 8 },
   footerText: {
     color: '#9CA3AF', fontSize: 12, lineHeight: 18, textAlign: 'center',
+  },
+  // ---- U1: permission-wait overlay ----
+  // Full-screen semi-transparent overlay so the user can't tap anything else
+  // while waiting for the system permission dialog. Centers a card with a
+  // spinner, an explanatory line, and a Cancel button.
+  permissionWaitOverlay: {
+    position: 'absolute',
+    left: 0, right: 0, top: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  permissionWaitCard: {
+    backgroundColor: COLOR.bg,
+    borderRadius: 16,
+    paddingVertical: 24,
+    paddingHorizontal: 32,
+    alignItems: 'center',
+    minWidth: 220,
+    elevation: 8,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25, shadowRadius: 16,
+  },
+  permissionWaitText: {
+    marginTop: 14,
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLOR.primary,
+    textAlign: 'center',
+  },
+  permissionWaitCancelBtn: {
+    marginTop: 18,
+    paddingVertical: 8,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLOR.divider,
+    backgroundColor: '#F3F4F6',
+  },
+  permissionWaitCancelText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: COLOR.primary,
   },
 });
 
