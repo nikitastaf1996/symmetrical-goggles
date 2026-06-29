@@ -1531,7 +1531,19 @@ function App(): React.ReactElement {
 
         {lastSavedPath && (
           <View style={styles.savedCard}>
-            <Text style={styles.savedTitle}>GPX СОХРАНЁН</Text>
+            <View style={styles.cardRow}>
+              <Text style={styles.savedTitle}>GPX СОХРАНЁН</Text>
+              {/* U19: dismiss button so the user can clear the saved card
+                  without starting a new recording. */}
+              <Pressable
+                style={styles.cardDismissBtn}
+                onPress={() => setLastSavedPath(null)}
+                hitSlop={8}
+                accessibilityLabel="Скрыть карточку сохранения"
+              >
+                <Text style={styles.cardDismissText}>✕</Text>
+              </Pressable>
+            </View>
             <Text style={styles.savedPath}>{lastSavedPath}</Text>
             {lastSavedDistance != null && (() => {
               const fmt = formatDistance(lastSavedDistance);
@@ -1558,7 +1570,19 @@ function App(): React.ReactElement {
 
         {errorMsg && (
           <View style={styles.errorCard}>
-            <Text style={styles.errorText}>{errorMsg}</Text>
+            <View style={styles.cardRow}>
+              <Text style={styles.errorText}>{errorMsg}</Text>
+              {/* U19: dismiss button so the user can clear the error card
+                  without starting a new recording. */}
+              <Pressable
+                style={styles.cardDismissBtn}
+                onPress={() => setErrorMsg(null)}
+                hitSlop={8}
+                accessibilityLabel="Скрыть ошибку"
+              >
+                <Text style={styles.cardDismissText}>✕</Text>
+              </Pressable>
+            </View>
             {/* U2: when permissions are missing (permanently denied or just
                 not yet granted), offer a button that opens the system app
                 settings page so the user can grant them. The native module
@@ -2117,6 +2141,29 @@ const styles = StyleSheet.create({
   },
   permissionButtonText: { color: COLOR.primary, fontSize: 14, fontWeight: '600' },
   // ---- Saved / error cards ----
+  // U19: shared row layout for the saved/error card title + dismiss button.
+  cardRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  // U19: shared dismiss (✕) button used by both the saved card and the
+  // error card. Small, neutral-coloured, top-right of the card.
+  cardDismissBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.05)',
+  },
+  cardDismissText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLOR.secondary,
+    lineHeight: 14,
+  },
   savedCard: {
     backgroundColor: COLOR.savedBg, borderRadius: 12, padding: 14,
     marginBottom: 16, borderWidth: 1, borderColor: COLOR.savedBorder,
