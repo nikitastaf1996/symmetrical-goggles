@@ -1188,7 +1188,15 @@ class GpsRecorderService : Service(), LocationListener {
                 rawWindow.poll()
             }
 
-            val speedOk = (pt.speed ?: 0f) < AUTO_PAUSE_SPEED_THRESHOLD_MPS
+            // L11 fix: do NOT treat a missing speed as 'stationary'. When
+            // Location.hasSpeed() is false (cold start, poor signal, some
+            // devices / emulators), pt.speed is null. The previous code
+            // coerced it to 0f, which made speedOk = true (stationary) and
+            // contributed to false auto-pause triggers even while the user
+            // was moving. We now treat a null speed as 'not stationary' so
+            // the displacement check (line below) is the sole backstop —
+            // exactly what we want when the GPS can't tell us our speed.
+            val speedOk = pt.speed?.let { it < AUTO_PAUSE_SPEED_THRESHOLD_MPS } ?: false
             val disp = maxDisplacementInWindow()
             val dispOk = disp < AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M
             val stopped = speedOk && dispOk
