@@ -949,8 +949,19 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
 
     @Suppress("DEPRECATION")
     override fun onCatalystInstanceDestroy() {
-        // Stop the monitor when the RN instance is torn down
+        // L14 fix: null the singleton FIRST so the service stops emitting
+        // events into a dead ReactApplicationContext. The previous code only
+        // tore down the GNSS monitor but left `instance` pointing at this
+        // dying module — across a dev reload (Cmd+R in Metro) the old module
+        // (and its ReactApplicationContext) leaked, and the service kept
+        // calling module.send(...) on a dead module. send() swallowed the
+        // exception so there was no crash, but the leak persisted.
+        instance = null
+        // Also null monitorLocationManager (see L35 in TODO 2 — same pattern).
+        // Even if the monitor was running, we tear it down below; nulling the
+        // manager here ensures a fresh one is created on next startGnssMonitor.
         try {
+            // Stop the monitor when the RN instance is torn down
             if (monitorRunning) {
                 monitorRunning = false
                 monitorHandler.removeCallbacks(monitorHeartbeat)
@@ -960,9 +971,19 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 }
                 monitorGnssCallback = null
             }
+            monitorLocationManager = null
         } catch (e: Exception) {
             Log.w(TAG, "onCatalystInstanceDestroy cleanup failed", e)
         }
+        // Resolve any pending permission promise so JS doesn't hang waiting
+        // for a callback that will never fire (L9 fix).
+        try {
+            pendingPermissionsPromise?.resolve(false)
+        } catch (_: Exception) {}
+        pendingPermissionsPromise = null
+        try {
+            (reactContext.currentActivity as? MainActivity)?.setPermissionResultCallback(null)
+        } catch (_: Exception) {}
         super.onCatalystInstanceDestroy()
     }
 
