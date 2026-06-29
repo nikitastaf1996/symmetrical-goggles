@@ -30,7 +30,7 @@
  *   - The monitor is stopped on unmount.
  */
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useReducer } from 'react';
 import {
   ActivityIndicator,
   AppState,
@@ -229,8 +229,15 @@ function App(): React.ReactElement {
   // 1 Hz and makes the TEMPO readout flicker between e.g. 4:30 and 6:10 from
   // one fix to the next. The window is cleared on stop / save so a fresh
   // recording starts with no history.
+  //
+  // U4: the window is also populated from the 'gnss' event when NOT
+  // recording (so the idle pace display uses the same smoothing instead of
+  // the raw instantaneous GNSS speed). Pushing to the array doesn't trigger
+  // a re-render, so we call forceRerender() after each push to make sure
+  // the smoothedSpeed computation below re-runs.
   const recentSpeedsRef = useRef<number[]>([]);
   const SPEED_WINDOW = 5; // ~5 seconds at 1 Hz — short enough to be responsive
+  const [, forceRerender] = useReducer(x => x + 1, 0);
   // Refs that mirror movingMs / elapsedMs / autoPauseEnabled so the
   // 'saved' event handler (which is set up ONCE in the mount effect and
   // must NOT re-run on every state change, otherwise we lose events) can
@@ -239,6 +246,11 @@ function App(): React.ReactElement {
   const movingMsRef = useRef<number>(0);
   const elapsedMsRef = useRef<number>(0);
   const autoPauseEnabledRef = useRef<boolean>(false);
+  // U10: mirror of isAutoPaused for use inside the 'location' event handler
+  // (which is set up once at mount and must not re-create on every state
+  // change). Without this ref, the handler closure would capture the initial
+  // false value and never see auto-pause activate.
+  const isAutoPausedRef = useRef<boolean>(false);
   // Bugfix: mirror gapDetectionEnabled too, so the saved-card pace logic
   // can read it from the (once-set-up) saved-event closure. See the
   // paceTimeMs comment above for why gap detection now also affects pace.
@@ -252,6 +264,9 @@ function App(): React.ReactElement {
   useEffect(() => { elapsedMsRef.current = elapsedMs; }, [elapsedMs]);
   useEffect(() => { autoPauseEnabledRef.current = autoPauseEnabled; }, [autoPauseEnabled]);
   useEffect(() => { gapDetectionEnabledRef.current = gapDetectionEnabled; }, [gapDetectionEnabled]);
+  // U10: keep isAutoPausedRef in sync so the 'location' handler (set up once
+  // at mount) can read the latest value without stale-closure issues.
+  useEffect(() => { isAutoPausedRef.current = isAutoPaused; }, [isAutoPaused]);
 
   // Sync state from native via getState(). Called on mount, on foreground, and every 2s.
   const syncStateFromNative = useCallback(async () => {
@@ -374,6 +389,17 @@ function App(): React.ReactElement {
         // overrides it.
         if (recordingStateRef.current !== 'recording') {
           setCurrentSpeed(ev.speed);
+          // U4: also push the GNSS speed into the smoothing window when
+          // idle so the displayed pace uses the smoothed average (no more
+          // 4:30 → 6:10 flicker). While recording, the 'location' event
+          // is the source of truth — we DON'T push gnss speeds then to
+          // avoid double-counting.
+          if (ev.speed != null) {
+            const w = recentSpeedsRef.current;
+            w.push(ev.speed);
+            if (w.length > SPEED_WINDOW) w.shift();
+            forceRerender();
+          }
         }
       }),
       subscribe('location', (ev: GpsLocationEvent) => {
@@ -382,7 +408,11 @@ function App(): React.ReactElement {
         if (typeof ev.distance === 'number') setDistance(ev.distance);
         if (ev.fixType) setFixType(ev.fixType);
         if (ev.accuracy != null) setAccuracy(ev.accuracy);
-        if (ev.speed != null) {
+        // U10: don't update currentSpeed while auto-paused — the service
+        // still emits location events (with the paused fix), but the
+        // underlying state shouldn't change. Read isAutoPaused from a ref
+        // to avoid stale-closure issues.
+        if (ev.speed != null && !isAutoPausedRef.current) {
           setCurrentSpeed(ev.speed);
           // Push into the smoothing window. We accept every fix here (even
           // slow / zero ones) so the window correctly reflects "user is
@@ -391,6 +421,11 @@ function App(): React.ReactElement {
           const w = recentSpeedsRef.current;
           w.push(ev.speed);
           if (w.length > SPEED_WINDOW) w.shift();
+          // U4: force a re-render so the smoothed pace display updates
+          // immediately. The push above mutated the ref's array in-place,
+          // which React doesn't see — without this the rendered pace would
+          // be stale until the next setState.
+          forceRerender();
         }
         setHasFix(ev.fixType !== 'no fix');
         // Phase 1/3/4: live auto-pause / signal-lost / moving-time.
