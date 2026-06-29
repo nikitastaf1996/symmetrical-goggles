@@ -856,13 +856,19 @@ function App(): React.ReactElement {
   // noise. The window is short (5 fixes ≈ 5 s) so the pace still tracks
   // real changes in effort within a few seconds.
   //
-  // While idle (no recording), we fall back to the GNSS monitor's speed.
+  // U7: now that U4 populates the window from BOTH the 'gnss' event (idle)
+  // AND the 'location' event (recording), we use the window whenever it
+  // has data — regardless of recording state. This eliminates the abrupt
+  // pace jump on idle→recording transition, because the smoothed value
+  // carries over (the location event just starts pushing into the same
+  // window the gnss event was filling).
+  //
   // While auto-paused, we suppress the pace (show "—") because the user is
   // stationary and any window average is meaningless.
   const smoothedSpeed = (() => {
     if (isAutoPaused) return null;
     const w = recentSpeedsRef.current;
-    if (isRecording && w.length > 0) {
+    if (w.length > 0) {
       const sum = w.reduce((a, b) => a + b, 0);
       return sum / w.length;
     }
