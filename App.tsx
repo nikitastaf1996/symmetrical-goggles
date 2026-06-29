@@ -598,16 +598,17 @@ function App(): React.ReactElement {
       }
     });
 
-    // Polling fallback: every 2 seconds, sync state from native.
-    const pollInterval = setInterval(() => {
-      syncStateFromNative();
-    }, 2000);
+    // Polling fallback: REMOVED from the mount effect (was always-on, wasting
+    // battery when idle). Replaced by the recording-gated useEffect below
+    // (U14) that only runs the 2 s poll while a recording is in progress.
+    // When idle, the 'gnss' event already keeps the UI fresh.
 
     return () => {
       mounted = false;
       subs.forEach((s) => s.remove());
       appStateSub.remove();
-      clearInterval(pollInterval);
+      // U14: no pollInterval to clear here — that's handled by the
+      // recording-gated useEffect below.
       // U6: stopGnssMonitor() returns a Promise — wrapping it in a
       // try/catch would NOT catch an async rejection. Use .catch() so an
       // unhandled promise rejection doesn't fire if the native module
@@ -615,6 +616,20 @@ function App(): React.ReactElement {
       GpsRecorder.stopGnssMonitor().catch(() => { /* ignore */ });
     };
   }, [syncStateFromNative]); // NOTE: recordingState intentionally omitted — see recordingStateRef.
+
+  // U14: 2-second syncStateFromNative polling, gated by recording state.
+  // The original always-on setInterval ran every 2 s for the entire app
+  // lifetime — wasting battery when idle (the 'gnss' event already keeps
+  // the UI fresh). Now we only poll while a recording is in progress, so
+  // the JS-native bridge isn't crossed every 2 s while the user is just
+  // looking at the idle screen.
+  useEffect(() => {
+    if (recordingState !== 'recording') return;
+    const id = setInterval(() => {
+      syncStateFromNative();
+    }, 2000);
+    return () => clearInterval(id);
+  }, [recordingState, syncStateFromNative]);
 
   const handleStart = useCallback(async () => {
     setErrorMsg(null);
