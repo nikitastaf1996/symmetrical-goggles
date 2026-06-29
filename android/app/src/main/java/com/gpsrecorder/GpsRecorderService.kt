@@ -1230,9 +1230,28 @@ class GpsRecorderService : Service(), LocationListener {
         if (isPostProcessEnabled()) {
             // B. Accuracy gate: skip fixes whose reported accuracy is worse than the
             // threshold. These are almost always multipath or cold-start noise.
+            //
+            // L4 fix: dropped fixes MUST still advance lastFixTimeMs, save live
+            // state, and emit a location event — same pattern the time-sampling
+            // drop (above) and the radial filter drop (below) use. Without this
+            // the UI's lastFix display freezes for the dropped fix, the gap
+            // watchdog falsely fires 'signalLost' after 15 s of dropped fixes,
+            // and getState() polling returns stale data.
+            //
+            // We do NOT advance prevLat/prevLon — these are dropped fixes and
+            // must not become the reference for the next fix's velocity /
+            // distance computation.
             val acc = pt.accuracy
             if (acc != null && acc > ACCURACY_THRESHOLD_M) {
                 Log.d(TAG, "On-the-fly filter: dropping low-accuracy fix (acc=${acc}m)")
+                lastFixTimeMs = pt.timeMs
+                saveLiveState(pt)
+                GpsRecorderModule.emitLocation(
+                    pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                    computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                    isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                )
+                updateNotification()
                 return
             }
             // C. Velocity-based plausibility gate: compute the instantaneous
@@ -1250,6 +1269,10 @@ class GpsRecorderService : Service(), LocationListener {
             // pause resume / gap recovery), so this gate is naturally bypassed
             // for the first fix after such a transition — exactly what we want,
             // since that fix has no meaningful "previous" to compare against.
+            //
+            // L4 fix (see accuracy gate above): the zero-dt and velocity drops
+            // also mirror the time-sampling drop pattern so the UI stays fresh
+            // and the gap watchdog doesn't fire falsely.
             var distanceToAdd = 0.0
             val pLat = prevLat
             val pLon = prevLon
@@ -1258,12 +1281,28 @@ class GpsRecorderService : Service(), LocationListener {
                 val dtSec = (pt.timeMs - pTime) / 1000.0
                 if (dtSec <= 0.0) {
                     Log.d(TAG, "On-the-fly filter: dropping zero-dt fix (dt=${dtSec}s)")
+                    lastFixTimeMs = pt.timeMs
+                    saveLiveState(pt)
+                    GpsRecorderModule.emitLocation(
+                        pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                        computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                        isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                    )
+                    updateNotification()
                     return
                 }
                 val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
                 val velocityMps = d / dtSec
                 if (velocityMps > MAX_VELOCITY_MPS) {
                     Log.d(TAG, "On-the-fly filter: dropping velocity outlier (v=${velocityMps}m/s d=${d}m dt=${dtSec}s)")
+                    lastFixTimeMs = pt.timeMs
+                    saveLiveState(pt)
+                    GpsRecorderModule.emitLocation(
+                        pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                        computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                        isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                    )
+                    updateNotification()
                     return
                 }
                 distanceToAdd = d
