@@ -583,11 +583,20 @@ function App(): React.ReactElement {
         recentSpeedsRef.current = [];
       }),
       subscribe('error', (ev) => {
-        // L10 fix: only reset the UI to idle on FATAL errors. Non-fatal
-        // errors (e.g. distance recompute failed) are informational — the
-        // recording is still running and resetting to idle would let the
-        // user press START while a recording is in progress, losing the
-        // in-progress track.
+        // L10 fix / U17: only reset the UI to idle on FATAL errors.
+        // Non-fatal errors (e.g. distance recompute failed, or
+        // finalizeGpxFile threw after the GPX was already written) are
+        // informational — the recording may still be running OR may have
+        // already completed normally. Resetting to idle on a non-fatal
+        // error would either:
+        //   (a) let the user press START while a recording is in progress,
+        //       losing the in-progress track; or
+        //   (b) skip showing the saved card (because we'd jump from
+        //       'stopping' straight to 'idle' before the 'saved' event
+        //       arrives).
+        // If a non-fatal error occurs during finalize, the 'saved' event
+        // still arrives (with the file path) and the saved card is shown
+        // normally — the user sees the error message AND the saved card.
         setErrorMsg(ev.message);
         if (ev.fatal) {
           setRecordingState('idle');
