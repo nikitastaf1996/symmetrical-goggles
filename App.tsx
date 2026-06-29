@@ -170,6 +170,17 @@ function App(): React.ReactElement {
   // get reset to 0 by the 'saved' handler, so we snapshot them here first.)
   const [lastSavedMovingMs, setLastSavedMovingMs] = useState<number>(0);
   const [lastSavedElapsedMs, setLastSavedElapsedMs] = useState<number>(0);
+  // U3: snapshot of the auto-pause / gap-detection toggle state at save
+  // time. Without this, the saved card's pace recomputes with whatever the
+  // CURRENT toggle state is — so if the user ends a recording and then
+  // flips auto-pause on (to prepare for the next run), the just-saved
+  // card's pace would flip between moving-time and elapsed-time bases.
+  // The snapshot is captured in the 'saved' event handler (BEFORE the user
+  // can change anything) and cleared on the next handleStart.
+  const [lastSavedSettings, setLastSavedSettings] = useState<{
+    autoPauseEnabled: boolean;
+    gapDetectionEnabled: boolean;
+  } | null>(null);
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [postProcessEnabled, setPostProcessEnabled] = useState<boolean>(false);
@@ -452,6 +463,15 @@ function App(): React.ReactElement {
         // is set up once at mount and would otherwise capture stale values.
         setLastSavedMovingMs(movingMsRef.current);
         setLastSavedElapsedMs(elapsedMsRef.current);
+        // U3: snapshot the toggle state at save time so the saved card's
+        // pace computation is stable — the user can flip auto-pause / gap
+        // detection AFTER the save (in preparation for the next run) and
+        // the just-saved card must not recompute its pace under the new
+        // toggle state.
+        setLastSavedSettings({
+          autoPauseEnabled: autoPauseEnabledRef.current,
+          gapDetectionEnabled: gapDetectionEnabledRef.current,
+        });
         setLastSavedPath(ev.filePath);
         // The native side sends the post-save distance (recomputed from the
         // saved GPX file, post-smoothing) so the UI shows the true track
@@ -560,6 +580,9 @@ function App(): React.ReactElement {
       setDistance(0);
       setCurrentSpeed(null);
       setLastSavedPath(null);
+      // U3: clear the save-time settings snapshot so the next recording's
+      // saved card gets a fresh snapshot (not the previous run's toggles).
+      setLastSavedSettings(null);
       startTimeRef.current = Date.now();
       // Clear the pace-smoothing window for the fresh recording.
       recentSpeedsRef.current = [];
@@ -1245,10 +1268,14 @@ function App(): React.ReactElement {
             <Text style={styles.savedPath}>{lastSavedPath}</Text>
             {lastSavedDistance != null && (() => {
               const fmt = formatDistance(lastSavedDistance);
-              // Bugfix: keep the saved-card pace consistent with the live
-              // pace logic — use movingMs whenever auto-pause OR gap
-              // detection was enabled at save time.
-              const tMs = (autoPauseEnabledRef.current || gapDetectionEnabledRef.current)
+              // U3: use the save-time snapshot of the toggle state, NOT the
+              // current toggle state. After a recording ends, the settings
+              // unlock and the user can flip auto-pause / gap detection to
+              // prepare for the next run — without the snapshot, the saved
+              // card's pace would silently recompute under the new state.
+              const ap = lastSavedSettings?.autoPauseEnabled ?? false;
+              const gd = lastSavedSettings?.gapDetectionEnabled ?? true;
+              const tMs = (ap || gd)
                 ? lastSavedMovingMs
                 : lastSavedElapsedMs;
               const pace = computeAvgPace(tMs, lastSavedDistance);
