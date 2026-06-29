@@ -16,6 +16,8 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
@@ -88,6 +90,20 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         // method is called from the JS thread.
         @Volatile private var pendingPermissionsPromise: Promise? = null
 
+        // L23 fix: pending promise for requestIgnoreBatteryOptimizations().
+        // Same pattern as pendingPermissionsPromise — resolved inside the
+        // ActivityResultCallback (via MainActivity.setBatteryResultCallback)
+        // so the JS caller's await resolves only after the user actually
+        // responds to the system dialog.
+        @Volatile private var pendingBatteryPromise: Promise? = null
+
+        // L24 fix: monotonically increasing sequence number for 'duration'
+        // events. Incremented on every emitDuration call so the JS side can
+        // ignore any 'duration' event whose seq is less than the last one it
+        // processed (e.g. when a getState() poll delivers an older elapsedMs
+        // value just after a duration event).
+        @Volatile private var durationSeq: Int = 0
+
         // ---- Event emitters called from GpsRecorderService ----
         fun emitLocation(
             lat: Double, lon: Double, alt: Double?, speed: Float?, accuracy: Float?,
@@ -119,6 +135,10 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
 
         fun emitDuration(elapsedMs: Long, movingMs: Long = 0L) {
             val module = instance ?: return
+            // L24 fix: increment the sequence number on every emit. JS uses
+            // this to ignore out-of-order events (e.g. a getState() poll
+            // delivering an older elapsedMs value just after a duration event).
+            val seq = ++durationSeq
             val map = Arguments.createMap().apply {
                 putDouble("elapsedMs", elapsedMs.toDouble())
                 // L8 fix: include movingMs in the 1 Hz duration tick so the JS
@@ -127,6 +147,9 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 // event's movingMs (which can be 0 for many seconds while the
                 // user is stationary under auto-pause).
                 putDouble("movingMs", movingMs.toDouble())
+                // L24 fix: include the sequence number so JS can detect /
+                // ignore out-of-order events.
+                putInt("seq", seq)
             }
             module.send("duration", map)
         }
@@ -263,6 +286,21 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
     @Volatile private var monitorRunning: Boolean = false
     private val monitorHandler = Handler(Looper.getMainLooper())
 
+    // L27 fix: cached last-emitted GnssState so the heartbeat can skip
+    // redundant emits when nothing has changed. The cache is reset to
+    // null on startGnssMonitor() (so the first emit is always sent) and
+    // cleared on stopGnssMonitor().
+    @Volatile private var lastEmittedFixType: String? = null
+    @Volatile private var lastEmittedAccuracy: Float? = null
+    @Volatile private var lastEmittedSatellitesUsed: Int = -1
+    @Volatile private var lastEmittedSatellitesInView: Int = -1
+    @Volatile private var lastEmittedHasFix: Boolean? = null
+    @Volatile private var lastEmittedLat: Double? = null
+    @Volatile private var lastEmittedLon: Double? = null
+    @Volatile private var lastEmittedAlt: Double? = null
+    @Volatile private var lastEmittedSpeed: Float? = null
+    @Volatile private var monitorFirstEmitPending: Boolean = false
+
     private val monitorLocationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
             monitorLastFixTimeMs = if (location.time > 0) location.time else System.currentTimeMillis()
@@ -283,24 +321,76 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         val now = System.currentTimeMillis()
         val recentFix = monitorLastFixTimeMs > 0 && (now - monitorLastFixTimeMs) < 10_000L
         if (!recentFix) return "no fix"
-        if (monitorSatellitesUsed == 0) return "no fix"
-        return if (monitorSatellitesUsed >= 4) "3D fix" else "2D fix"
+        // L16 fix: a real 2D fix requires ≥3 satellites — with 1–2 sats no
+        // position solution exists, so the UI should say "no fix".
+        return when {
+            monitorSatellitesUsed >= 4 -> "3D fix"
+            monitorSatellitesUsed == 3 -> "2D fix"
+            else -> "no fix"
+        }
     }
 
-    private fun emitGnssFromMonitor() {
+    /**
+     * L27 fix: emits the current GNSS state to JS, but ONLY if it has
+     * changed since the last emit (or if [force] is true). Called by the
+     * heartbeat every 3 s and by the location / GnssStatus callbacks.
+     *
+     * - On startGnssMonitor(): set monitorFirstEmitPending = true so the
+     *   first emit is always sent (the cache is empty anyway, but this is
+     *   a belt-and-braces guard).
+     * - On stopGnssMonitor(): call emitGnssFromMonitor(force = true) before
+     *   tearing down so the last state is sent.
+     */
+    private fun emitGnssFromMonitor(force: Boolean = false) {
         val fixType = computeMonitorFixType()
         val hasFix = fixType != "no fix"
+        val acc = monitorLastAccuracy
+        val sUsed = monitorSatellitesUsed
+        val sView = monitorSatellitesInView
+        val lat = monitorLastLat
+        val lon = monitorLastLon
+        val alt = monitorLastAlt
+        val spd = monitorLastSpeed
+
+        if (!force && !monitorFirstEmitPending &&
+            fixType == lastEmittedFixType &&
+            acc == lastEmittedAccuracy &&
+            sUsed == lastEmittedSatellitesUsed &&
+            sView == lastEmittedSatellitesInView &&
+            hasFix == lastEmittedHasFix &&
+            lat == lastEmittedLat &&
+            lon == lastEmittedLon &&
+            alt == lastEmittedAlt &&
+            spd == lastEmittedSpeed
+        ) {
+            // L27 fix: state unchanged — skip the emit. This eliminates ~20
+            // redundant JS events per minute when the GNSS state is stable.
+            return
+        }
+
         emitGnssStatus(
             fixType = fixType,
-            accuracy = monitorLastAccuracy,
-            satellitesUsed = monitorSatellitesUsed,
-            satellitesInView = monitorSatellitesInView,
+            accuracy = acc,
+            satellitesUsed = sUsed,
+            satellitesInView = sView,
             hasFix = hasFix,
-            lat = monitorLastLat,
-            lon = monitorLastLon,
-            altitude = monitorLastAlt,
-            speed = monitorLastSpeed
+            lat = lat,
+            lon = lon,
+            altitude = alt,
+            speed = spd
         )
+
+        // Update the cache.
+        lastEmittedFixType = fixType
+        lastEmittedAccuracy = acc
+        lastEmittedSatellitesUsed = sUsed
+        lastEmittedSatellitesInView = sView
+        lastEmittedHasFix = hasFix
+        lastEmittedLat = lat
+        lastEmittedLon = lon
+        lastEmittedAlt = alt
+        lastEmittedSpeed = spd
+        monitorFirstEmitPending = false
     }
 
     /**
@@ -381,6 +471,9 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 // ignore
             }
             monitorRunning = true
+            // L27 fix: force the first emit after start so the UI gets an
+            // immediate state update even if no satellites have changed.
+            monitorFirstEmitPending = true
             monitorHandler.post(monitorHeartbeat)
             Log.i(TAG, "GNSS monitor started")
             promise.resolve(true)
@@ -395,6 +488,9 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             if (!monitorRunning) {
                 promise.resolve(true); return
             }
+            // L27 fix: force a final emit before tearing down so the JS
+            // side gets the last known state.
+            emitGnssFromMonitor(force = true)
             monitorRunning = false
             monitorHandler.removeCallbacks(monitorHeartbeat)
             try {
@@ -411,6 +507,18 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
                 }
                 monitorGnssCallback = null
             }
+            // L27 fix: clear the cache so the next startGnssMonitor() will
+            // always emit at least once.
+            lastEmittedFixType = null
+            lastEmittedAccuracy = null
+            lastEmittedSatellitesUsed = -1
+            lastEmittedSatellitesInView = -1
+            lastEmittedHasFix = null
+            lastEmittedLat = null
+            lastEmittedLon = null
+            lastEmittedAlt = null
+            lastEmittedSpeed = null
+            monitorFirstEmitPending = false
             Log.i(TAG, "GNSS monitor stopped")
             promise.resolve(true)
         } catch (e: Exception) {
@@ -916,14 +1024,66 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             if (pm.isIgnoringBatteryOptimizations(pkg)) {
                 promise.resolve(true); return
             }
+            val activity = reactContext.currentActivity as? MainActivity
+            if (activity == null) {
+                // No Activity attached — can't launch the system dialog.
+                // Resolve with false so JS knows the request didn't happen.
+                Log.w(TAG, "requestIgnoreBatteryOptimizations: no Activity attached; resolving false")
+                promise.resolve(false)
+                return
+            }
+
+            // L23 fix (option A): resolve the promise ONLY after the user
+            // actually responds to the system dialog. Previously this method
+            // launched the dialog and immediately resolved with
+            // pm.isIgnoringBatteryOptimizations(pkg), which almost always
+            // returned false because the user hadn't had time to respond.
+            //
+            // If a second request arrives while one is pending, reject the
+            // first with "superseded" (same pattern as requestPermissions).
+            pendingBatteryPromise?.reject("superseded", "Superseded by a newer requestIgnoreBatteryOptimizations call")
+            pendingBatteryPromise = promise
+
+            // The callback fires on the main thread when the user returns
+            // from the system dialog. It calls resolvePendingBatteryOptimization()
+            // with the current isIgnoringBatteryOptimizations value.
+            activity.setBatteryResultCallback {
+                val granted = pm.isIgnoringBatteryOptimizations(pkg)
+                resolvePendingBatteryOptimization(granted)
+            }
+
             val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                 data = Uri.parse("package:$pkg")
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
-            reactContext.startActivity(intent)
-            promise.resolve(pm.isIgnoringBatteryOptimizations(pkg))
+            try {
+                activity.requestBatteryOptimizationFromJs(intent)
+            } catch (e: Exception) {
+                // Launch failed — reject so JS doesn't hang.
+                Log.w(TAG, "requestIgnoreBatteryOptimizations: launch failed", e)
+                resolvePendingBatteryOptimization(false)
+            }
         } catch (e: Exception) {
-            promise.reject("E_BATTERY", e.message ?: "battery opt error", e)
+            try { pendingBatteryPromise?.reject("E_BATTERY", e.message ?: "battery opt error", e) } catch (_: Exception) {}
+            pendingBatteryPromise = null
+            try { promise.reject("E_BATTERY", e.message ?: "battery opt error", e) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Resolves the pending battery-optimization promise (if any) with the
+     * given `granted` value and clears the field. Safe to call when no
+     * promise is pending (no-op).
+     */
+    private fun resolvePendingBatteryOptimization(granted: Boolean) {
+        val p = pendingBatteryPromise
+        pendingBatteryPromise = null
+        // Clear the activity-side callback too.
+        try {
+            (reactContext.currentActivity as? MainActivity)?.setBatteryResultCallback(null)
+        } catch (_: Exception) {}
+        if (p != null) {
+            try { p.resolve(granted) } catch (_: Exception) {}
         }
     }
 
@@ -981,8 +1141,14 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             pendingPermissionsPromise?.resolve(false)
         } catch (_: Exception) {}
         pendingPermissionsPromise = null
+        // L23 fix: also resolve any pending battery-optimization promise.
+        try {
+            pendingBatteryPromise?.resolve(false)
+        } catch (_: Exception) {}
+        pendingBatteryPromise = null
         try {
             (reactContext.currentActivity as? MainActivity)?.setPermissionResultCallback(null)
+            (reactContext.currentActivity as? MainActivity)?.setBatteryResultCallback(null)
         } catch (_: Exception) {}
         super.onCatalystInstanceDestroy()
     }

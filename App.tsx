@@ -224,6 +224,11 @@ function App(): React.ReactElement {
   // can read it from the (once-set-up) saved-event closure. See the
   // paceTimeMs comment above for why gap detection now also affects pace.
   const gapDetectionEnabledRef = useRef<boolean>(true);
+  // L24 fix: track the last 'duration' event's sequence number so we can
+  // ignore out-of-order events (which were causing the displayed timer to
+  // occasionally jump backwards by ~1 s when a getState() poll delivered
+  // an older elapsedMs value just after a duration event).
+  const lastDurationSeqRef = useRef<number>(0);
   useEffect(() => { movingMsRef.current = movingMs; }, [movingMs]);
   useEffect(() => { elapsedMsRef.current = elapsedMs; }, [elapsedMs]);
   useEffect(() => { autoPauseEnabledRef.current = autoPauseEnabled; }, [autoPauseEnabled]);
@@ -236,7 +241,12 @@ function App(): React.ReactElement {
       if (state.isRecording) {
         setRecordingState((prev) => (prev === 'stopping' ? prev : 'recording'));
         setPointCount(state.pointCount);
-        setElapsedMs(state.elapsedMs);
+        // L24 fix: don't let a getState() poll overwrite elapsedMs with an
+        // older value. The duration tick (1 Hz) is the authoritative source
+        // for elapsedMs; the poll is a fallback for when events are dropped.
+        // If the poll's elapsedMs is less than what we're already showing,
+        // ignore it (a newer duration event will arrive within a second).
+        setElapsedMs((prev) => (state.elapsedMs >= prev ? state.elapsedMs : prev));
         if (typeof state.distance === 'number') setDistance(state.distance);
         if (state.fixType) setFixType(state.fixType);
         // Phase 1/3/4: sync auto-pause / signal-lost / moving-time from native.
@@ -370,6 +380,22 @@ function App(): React.ReactElement {
         if (typeof ev.movingMs === 'number') setMovingMs(ev.movingMs);
       }),
       subscribe('duration', (ev) => {
+        // L24 fix: ignore out-of-order duration events using the
+        // monotonically increasing sequence number. The state poll
+        // (syncStateFromNative, every 2 s) also sets elapsedMs, and the
+        // two paths can deliver values out of order — causing the
+        // displayed timer to occasionally jump backwards by ~1 s.
+        //
+        // We track the last-processed seq in a ref; any event with a seq
+        // <= the last one is silently dropped. The getState() poll is
+        // also gated to not overwrite elapsedMs if its value is less than
+        // the current value (see syncStateFromNative).
+        if (typeof ev.seq === 'number' && ev.seq <= lastDurationSeqRef.current) {
+          return;
+        }
+        if (typeof ev.seq === 'number') {
+          lastDurationSeqRef.current = ev.seq;
+        }
         setElapsedMs(ev.elapsedMs);
         if (startTimeRef.current == null) {
           startTimeRef.current = Date.now() - ev.elapsedMs;

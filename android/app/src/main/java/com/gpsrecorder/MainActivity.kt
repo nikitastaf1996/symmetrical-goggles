@@ -1,9 +1,11 @@
 package com.gpsrecorder
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.facebook.react.ReactActivity
@@ -88,6 +90,63 @@ class MainActivity : ReactActivity() {
         }
 
     /**
+     * L23 fix: ActivityResultLauncher for the system "Ignore battery
+     * optimizations" dialog. We can't use RequestPermission() here because
+     * battery-optimization is NOT a runtime permission — it's a system
+     * settings page launched via ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS.
+     * The StartActivityForResult contract fires onActivityResult when the
+     * user returns, which is when we re-check isIgnoringBatteryOptimizations.
+     */
+    private val batteryOptimizationLauncher: ActivityResultLauncher<Intent> =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { _ ->
+            // The user has returned from the battery-optimization system
+            // page (either by granting or denying). Notify the pending JS
+            // request so it can resolve with the current
+            // isIgnoringBatteryOptimizations value.
+            notifyBatteryResult()
+        }
+
+    /**
+     * L23 fix: callback invoked when the user returns from the battery-
+     * optimization system page. Set by [GpsRecorderModule.requestIgnoreBatteryOptimizations]
+     * and cleared after it fires.
+     */
+    @Volatile
+    private var batteryResultCallback: (() -> Unit)? = null
+
+    fun setBatteryResultCallback(cb: (() -> Unit)?) {
+        batteryResultCallback = cb
+    }
+
+    private fun notifyBatteryResult() {
+        batteryResultCallback?.let { cb ->
+            batteryResultCallback = null
+            try { cb() } catch (e: Exception) {
+                Log.w(TAG, "Battery result callback threw", e)
+            }
+        }
+    }
+
+    /**
+     * Called from JS via [GpsRecorderModule.requestIgnoreBatteryOptimizations].
+     * Launches the system battery-optimization dialog via the registered
+     * ActivityResultLauncher so we get a callback when the user returns.
+     */
+    fun requestBatteryOptimizationFromJs(intent: Intent) {
+        window.decorView.post {
+            try {
+                batteryOptimizationLauncher.launch(intent)
+                Log.i(TAG, "Launched battery-optimization system page")
+            } catch (e: Exception) {
+                // Some devices throw if the activity state is wrong; notify
+                // the pending callback so JS doesn't hang.
+                Log.w(TAG, "Battery optimization launch failed", e)
+                notifyBatteryResult()
+            }
+        }
+    }
+
+    /**
      * L9 fix: callback invoked when the user actually responds to the core
      * permission dialog. Set by [GpsRecorderModule.requestPermissions] and
      * cleared after it fires. Stored statically so a re-created activity
@@ -122,6 +181,13 @@ class MainActivity : ReactActivity() {
         // Auto-request on first resume so the user doesn't have to grant permissions
         // manually from Android Settings.
         maybeAutoRequestPermissions()
+        // L23 fix: if the user navigated away from the battery-optimization
+        // page without our launcher being the one to bring them back (e.g.
+        // they pressed Home and re-opened the app), notify the pending
+        // callback so JS doesn't hang.
+        if (batteryResultCallback != null) {
+            notifyBatteryResult()
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

@@ -36,6 +36,10 @@ export type GpsDurationEvent = {
   // updated yet — when present, App.tsx prefers it over the location
   // event's movingMs.
   movingMs?: number;
+  // L24 fix: monotonically increasing sequence number. JS uses this to
+  // ignore out-of-order 'duration' events (e.g. when a getState() poll
+  // delivers an older elapsedMs value just after a duration event).
+  seq?: number;
 };
 
 export type GpsStateEvent = {
