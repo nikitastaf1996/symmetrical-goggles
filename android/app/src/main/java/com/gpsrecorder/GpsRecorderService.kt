@@ -1065,7 +1065,7 @@ class GpsRecorderService : Service(), LocationListener {
             val a = pts[i]
             for (j in (i + 1) until pts.size) {
                 val b = pts[j]
-                val d = haversineMeters(a.lat, a.lon, b.lat, b.lon)
+                val d = TrackMath.haversineMeters(a.lat, a.lon, b.lat, b.lon)
                 if (d > maxD) maxD = d
             }
         }
@@ -1462,7 +1462,7 @@ class GpsRecorderService : Service(), LocationListener {
                     updateNotification()
                     return
                 }
-                val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+                val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
                 if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
                     val velocityMps = d / dtSec
                     if (velocityMps > MAX_VELOCITY_MPS) {
@@ -1545,7 +1545,7 @@ class GpsRecorderService : Service(), LocationListener {
                 val pLat = prevLat
                 val pLon = prevLon
                 if (pLat != null && pLon != null) {
-                    val d = haversineMeters(pLat, pLon, pt.lat, pt.lon)
+                    val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
                     precomputedD = d
                     val threshold = getRadialDistanceThresholdM().toDouble()
                     if (d < threshold) {
@@ -1639,7 +1639,7 @@ class GpsRecorderService : Service(), LocationListener {
                 SafeLog.d(TAG, "accumulateDistance: dropping zero-dt fix (dt=${dtSec}s)")
                 return
             }
-            val d = precomputedDistanceM ?: haversineMeters(pLat, pLon, pt.lat, pt.lon)
+            val d = precomputedDistanceM ?: TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
             // L22 fix: bypass velocity gate for sub-half-second dt — the
             // displacement is too small to produce a reliable velocity.
             if (dtSec >= MIN_VELOCITY_GATE_DT_SEC) {
@@ -1748,7 +1748,7 @@ class GpsRecorderService : Service(), LocationListener {
                     val pLat = prevLat
                     val pLon = prevLon
                     if (pLat != null && pLon != null) {
-                        total += haversineMeters(pLat, pLon, p.lat, p.lon)
+                        total += TrackMath.haversineMeters(pLat, pLon, p.lat, p.lon)
                     }
                     prevLat = p.lat
                     prevLon = p.lon
@@ -1769,21 +1769,6 @@ class GpsRecorderService : Service(), LocationListener {
             )
             return -1.0
         }
-    }
-
-    /**
-     * Returns the great-circle distance between two lat/lon points in meters.
-     * Uses the Haversine formula.
-     */
-    private fun haversineMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val r = 6_371_000.0 // Earth radius in meters
-        val dLat = Math.toRadians(lat2 - lat1)
-        val dLon = Math.toRadians(lon2 - lon1)
-        val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-            Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
-            Math.sin(dLon / 2) * Math.sin(dLon / 2)
-        val c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-        return r * c
     }
 
     /**
@@ -2764,7 +2749,7 @@ class GpsRecorderService : Service(), LocationListener {
             var maxDist = -1.0
             var maxIdx = -1
             for (i in start + 1 until end) {
-                val d = crossTrackDistanceM(points[i].lat, points[i].lon, a.lat, a.lon, b.lat, b.lon)
+                val d = TrackMath.crossTrackDistanceM(points[i].lat, points[i].lon, a.lat, a.lon, b.lat, b.lon)
                 if (d > maxDist) {
                     maxDist = d
                     maxIdx = i
@@ -2781,67 +2766,6 @@ class GpsRecorderService : Service(), LocationListener {
             if (keep[i]) out.add(points[i])
         }
         return out
-    }
-
-    /**
-     * Great-circle cross-track distance: the perpendicular distance from
-     * point [pLat, pLon] to the great circle through [aLat, aLon] and
-     * [bLat, bLon], in meters. Always returned as a non-negative value.
-     *
-     * L12 fix: when a and b coincide (degenerate segment), the function now
-     * returns 0.0 instead of the haversine distance from a to p. The previous
-     * behavior was harmful for Douglas-Peucker: a "segment" with identical
-     * endpoints would keep every intermediate point whose distance from that
-     * single point exceeded epsilon — effectively keeping everything, the
-     * opposite of simplification. A degenerate segment represents a single
-     * location and has no meaningful "perpendicular distance" to measure;
-     * returning 0.0 causes Douglas-Peucker to drop all intermediate points
-     * (none of them are farther than epsilon from the segment), which is
-     * correct because the segment is meaningless.
-     *
-     * Formula (non-degenerate case):
-     *   δ13 = d13 / R            (angular distance from a to p)
-     *   θ13 = bearing(a → p)
-     *   θ12 = bearing(a → b)
-     *   d_xt = asin( sin(δ13) · sin(θ13 − θ12) ) · R
-     */
-    private fun crossTrackDistanceM(
-        pLat: Double, pLon: Double,
-        aLat: Double, aLon: Double,
-        bLat: Double, bLon: Double
-    ): Double {
-        // L12 fix: degenerate segment (a and b coincide). Return 0.0 so
-        // Douglas-Peucker drops all intermediate points in such a segment
-        // (they can't be farther than epsilon from a meaningless segment).
-        if (aLat == bLat && aLon == bLon) {
-            return 0.0
-        }
-        val r = 6_371_000.0
-        val d13 = haversineMeters(aLat, aLon, pLat, pLon) / r
-        if (d13 == 0.0) return 0.0
-        val theta13 = bearingRad(aLat, aLon, pLat, pLon)
-        val theta12 = bearingRad(aLat, aLon, bLat, bLon)
-        // Clamp the asin argument to [-1.0, 1.0] to absorb floating-point
-        // drift. Math.sin(d13) * Math.sin(theta13 - theta12) can evaluate
-        // slightly outside the legal domain of asin when the point lies on
-        // (or numerically coincides with) the great-circle arc, which would
-        // otherwise make asin return NaN and poison the Douglas-Peucker
-        // recursion downstream.
-        val sinArg = Math.sin(d13) * Math.sin(theta13 - theta12)
-        val clampedArg = sinArg.coerceIn(-1.0, 1.0)
-        val dXt = Math.asin(clampedArg) * r
-        return Math.abs(dXt)
-    }
-
-    /** Initial bearing from (lat1, lon1) to (lat2, lon2), in radians. */
-    private fun bearingRad(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-        val phi1 = Math.toRadians(lat1)
-        val phi2 = Math.toRadians(lat2)
-        val dLambda = Math.toRadians(lon2 - lon1)
-        val y = Math.sin(dLambda) * Math.cos(phi2)
-        val x = Math.cos(phi1) * Math.sin(phi2) -
-            Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLambda)
-        return Math.atan2(y, x)
     }
 
     /** Counts <trkpt> elements in a GPX document (used for post-process logging). */
