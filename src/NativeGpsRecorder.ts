@@ -253,3 +253,17 @@ export function subscribe<K extends keyof GpsRecorderEvents>(
 ): EmitterSubscription {
   return DeviceEventEmitter.addListener(event, handler as (p: unknown) => void);
 }
+
+/**
+ * O14: Detect whether the native GpsRecorder module is actually loaded.
+ *
+ * The fallback object above makes every method a no-op when the native
+ * module is missing (e.g. package not registered, or the iOS branch was
+ * removed but the JS still ran). Without this check the app would launch
+ * normally but every button would silently do nothing — confusing.
+ *
+ * App.tsx renders a full-screen error when this returns false.
+ */
+export const isNativeModuleAvailable: boolean =
+  NativeModules.GpsRecorder !== undefined &&
+  typeof (NativeModules.GpsRecorder as { start?: unknown } | undefined)?.start === 'function';

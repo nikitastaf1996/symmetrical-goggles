@@ -45,6 +45,7 @@ import {
 import {
   GpsRecorder,
   subscribe,
+  isNativeModuleAvailable,
   type GpsLocationEvent,
   type GpsStateEvent,
   type GpsSavedEvent,
@@ -55,134 +56,22 @@ import {
 // O19: use react-native-safe-area-context instead of the deprecated built-in.
 // The built-in SafeAreaView from 'react-native' is unreliable on Android notches.
 import { SafeAreaView } from 'react-native-safe-area-context';
-
-type RecordingState = 'idle' | 'recording' | 'stopping';
-
-// ---- Palette (light, minimalist, inspired by the reference screenshot) ----
-const COLOR = {
-  bg: '#FFFFFF',
-  primary: '#0A2463',        // deep navy — for all numerals
-  secondary: '#6B7280',      // medium gray — for labels
-  divider: '#E5E7EB',        // very light gray — for dividers
-  accentStart: '#0A2463',    // navy — START button
-  accentStop: '#DC2626',     // red — STOP button
-  accentStopping: '#9CA3AF', // gray — STOPPING state
-  // Phase 6: auto-pause / signal-lost palette.
-  pauseAccent: '#D97706',    // amber — auto-paused indicator
-  pauseBg: '#FFFBEB',        // light amber background for pause banner
-  pauseBorder: '#FDE68A',    // amber border for pause banner
-  signalLostAccent: '#DC2626', // red — signal-lost banner
-  signalLostBg: '#FEF2F2',     // light red background for signal-lost banner
-  signalLostBorder: '#FECACA', // red border for signal-lost banner
-  gnssGreen: '#16A34A',
-  gnssAmber: '#D97706',
-  gnssRed: '#DC2626',
-  gnssGray: '#9CA3AF',
-  errorBg: '#FEF2F2',
-  errorBorder: '#FECACA',
-  errorText: '#991B1B',
-  savedBg: '#F0FDF4',
-  savedBorder: '#BBF7D0',
-  savedText: '#166534',
-};
-
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : String(n);
-}
-
-/**
- * U5: Russian plural-forms helper.
- *
- * Russian has three plural forms:
- *   - 1, 21, 31, …  → forms[0]  ("точка")
- *   - 2, 3, 4, 22, 23, 24, …  → forms[1]  ("точки")
- *   - 0, 5–20, 25–30, …  → forms[2]  ("точек")
- *
- * The 11–14 exception is handled by the mod100 check (11–14 all share the
- * same form as 5–20). The helper works for any noun — pass the three forms
- * in [one, few, many] order.
- */
-function pluralRu(n: number, forms: [string, string, string]): string {
-  const abs = Math.abs(n);
-  const mod10 = abs % 10;
-  const mod100 = abs % 100;
-  if (mod10 === 1 && mod100 !== 11) return forms[0];
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return forms[1];
-  return forms[2];
-}
-
-// O24: This is duplicated in GpsRecorderService.kt (formatDuration). The two
-// MUST stay in sync — if you change the format here, change the Kotlin
-// version too. See CHANGELOG.md / TODO 4, O24 for context.
-function formatDuration(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  if (h > 0) return `${h}:${pad2(m)}:${pad2(s)}`;
-  return `${pad2(m)}:${pad2(s)}`;
-}
-
-/**
- * Formats a distance in meters as a runner-friendly string with the unit
- * separated, so the UI can render the number largely and the unit small:
- *   - < 1500 m   -> { value: "123", unit: "m" }   (was: < 1000 m)
- *   - < 10000 m  -> { value: "1.50", unit: "km" } (2-decimal km)
- *   - >= 10000 m -> { value: "10.0", unit: "km" } (1-decimal km)
- *
- * U11: changed the m→km boundary from 1000 m to 1500 m so that 1000 m →
- * "1000 m" (not "1.00 km" — an abrupt precision drop). The 1500 m threshold
- * keeps the unit consistent within a typical short-run distance band and
- * only switches to km once 1.50 km reads cleaner than 1500 m.
- *
- * U11: also added a NaN / Infinity / negative guard so a buggy distance
- * accumulator can't render "NaN km" or "Infinity km" — falls back to "0 m".
- */
-function formatDistance(distanceM: number): { value: string; unit: string } {
-  if (!Number.isFinite(distanceM) || distanceM < 0) return { value: '0', unit: 'm' };
-  if (distanceM < 1500) return { value: String(Math.round(distanceM)), unit: 'm' };
-  if (distanceM < 10000) return { value: (distanceM / 1000).toFixed(2), unit: 'km' };
-  return { value: (distanceM / 1000).toFixed(1), unit: 'km' };
-}
-
-/**
- * Average pace from elapsed time and total distance, in "M:SS" per km.
- * Returns null if there is no measurable distance or elapsed time yet.
- *
- * Phase 6: when auto-pause is enabled, callers should pass the active moving
- * time (movingMs) instead of wall-clock elapsed time so paused intervals
- * don't inflate the displayed average pace.
- */
-function computeAvgPace(elapsedMs: number, distanceM: number): string | null {
-  if (!distanceM || distanceM < 1) return null;
-  if (!elapsedMs || elapsedMs < 1000) return null;
-  const minutesTotal = elapsedMs / 60000.0;
-  const km = distanceM / 1000.0;
-  const pace = minutesTotal / km;
-  if (!isFinite(pace) || pace <= 0) return null;
-  const wholeMin = Math.floor(pace);
-  const sec = Math.round((pace - wholeMin) * 60);
-  if (sec === 60) return `${wholeMin + 1}:00`;
-  return `${wholeMin}:${pad2(sec)}`;
-}
-
-/**
- * Current (instantaneous) pace from GPS speed (m/s), in "M:SS" per km.
- * Returns null if speed is missing or below the standing-still threshold.
- *
- * The threshold is 0.5 m/s (~1.8 km/h) — a slow shuffle. Anything below
- * this is either genuinely standing still or GPS noise around a stationary
- * user, and showing a "33:00 /km" pace in those moments is more confusing
- * than just showing "—".
- */
-function computeCurrentPace(speedMps: number | null | undefined): string | null {
-  if (speedMps == null || speedMps <= 0.5) return null;  // ignore < 1.8 km/h (standing still / GPS noise)
-  const paceSecPerKm = 1000 / speedMps;                  // seconds per km
-  const wholeMin = Math.floor(paceSecPerKm / 60);
-  const sec = Math.round(paceSecPerKm % 60);
-  if (sec === 60) return `${wholeMin + 1}:00`;
-  return `${wholeMin}:${pad2(sec)}`;
-}
+// O8: extracted presentational components + shared palette / formatters.
+import { BigStat } from './src/components/BigStat';
+import { Divider } from './src/components/Divider';
+import { StepperRow } from './src/components/StepperRow';
+import { GnssPill } from './src/components/GnssPill';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
+import {
+  COLOR,
+  pad2,
+  pluralRu,
+  formatDuration,
+  formatDistance,
+  computeAvgPace,
+  computeCurrentPace,
+  type RecordingState,
+} from './src/styles';
 
 function App(): React.ReactElement {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle');
@@ -1073,13 +962,28 @@ function App(): React.ReactElement {
   // the avg pace stays honest across tunnels / indoor stretches where the
   // GPS drops out. Without this, a 5-minute tunnel would inflate the avg
   // pace from e.g. 5:30/km to 6:30/km because elapsedMs kept ticking
-  // through the outage while distance did not.
-  //
   // When BOTH settings are off, movingMs equals elapsedMs (no transitions
   // ever fire), so we use elapsedMs directly to avoid the small overhead
   // of the movingMs path.
   const paceTimeMs = (autoPauseEnabled || gapDetectionEnabled) ? movingMs : elapsedMs;
   const avgPace = computeAvgPace(paceTimeMs, distance);
+
+  // O14: if the native module is not loaded (e.g. package not registered,
+  // or the iOS branch was removed but the JS still ran), the fallback
+  // object makes every method a no-op. Without this check the app would
+  // launch normally but every button would silently do nothing — confusing.
+  // All hooks above run unconditionally so this early return is safe.
+  if (!isNativeModuleAvailable) {
+    return (
+      <View style={styles.nativeMissingContainer}>
+        <Text style={styles.nativeMissingTitle}>Нативный модуль не загружен</Text>
+        <Text style={styles.nativeMissingBody}>
+          Приложение не сможет записывать GPS. Попробуйте переустановить
+          приложение.
+        </Text>
+      </View>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
@@ -1676,155 +1580,6 @@ function App(): React.ReactElement {
   );
 }
 
-/**
- * Big-stat block: small uppercase label, then a huge numeral. Optional `unit`
- * is rendered small and to the right of the value (e.g. "km", "/km").
- * Phase 3: optional `valueColor` overrides the default navy when the value
- * needs to be visually de-emphasized (e.g. the TIME value turns amber while
- * auto-pause is active).
- */
-function BigStat({
-  label,
-  value,
-  unit,
-  compact,
-  valueColor,
-}: {
-  label: string;
-  value: string;
-  unit?: string;
-  compact?: boolean;
-  valueColor?: string;
-}): React.ReactElement {
-  return (
-    <View style={[styles.statBlock, compact ? styles.statBlockCompact : null]}>
-      <Text style={styles.statLabel}>{label}</Text>
-      <View style={styles.statValueRow}>
-        <Text
-          style={[
-            styles.statValue,
-            compact ? styles.statValueCompact : null,
-            valueColor != null ? { color: valueColor } : null,
-          ]}
-        >
-          {value}
-        </Text>
-        {unit != null && <Text style={styles.statUnit}>{unit}</Text>}
-      </View>
-    </View>
-  );
-}
-
-function Divider(): React.ReactElement {
-  return <View style={styles.divider} />;
-}
-
-/**
- * Numeric stepper row: a small label, the current value with its unit, and
- * a minus / plus button pair. Used by the three data-reduction filter
- * settings (radial distance threshold, time sampling N, Douglas-Peucker
- * epsilon) to expose the user-tunable parameter.
- *
- * The row is always visible (even when the parent toggle is off) so the
- * user can preview / configure the parameter before enabling the filter.
- * The −/+ buttons are disabled when `disabled` is true (recording in
- * progress) OR when the value is at the min / max.
- *
- * Visually merges with the toggle row above it: shares the same horizontal
- * padding + border + background, has no top border-radius, and a slightly
- * smaller vertical padding so the two rows read as one "setting card".
- */
-function StepperRow({
-  label,
-  value,
-  unit,
-  min,
-  max,
-  disabled,
-  onDecrement,
-  onIncrement,
-}: {
-  label: string;
-  value: number;
-  unit: string;
-  min: number;
-  max: number;
-  disabled: boolean;
-  onDecrement: () => void;
-  onIncrement: () => void;
-}): React.ReactElement {
-  const canDec = !disabled && value > min;
-  const canInc = !disabled && value < max;
-  return (
-    <View style={[styles.stepperRow, disabled && styles.toggleRowLocked]}>
-      <Pressable
-        style={[styles.stepperBtn, !canDec && styles.stepperBtnDisabled]}
-        onPress={onDecrement}
-        disabled={!canDec}
-        hitSlop={8}
-      >
-        <Text style={[styles.stepperBtnText, !canDec && styles.stepperBtnTextDisabled]}>−</Text>
-      </Pressable>
-      <View style={styles.stepperValueWrap}>
-        <Text style={styles.stepperLabel}>{label}</Text>
-        <Text style={styles.stepperValue}>
-          {value}
-          <Text style={styles.stepperUnit}> {unit}</Text>
-        </Text>
-      </View>
-      <Pressable
-        style={[styles.stepperBtn, !canInc && styles.stepperBtnDisabled]}
-        onPress={onIncrement}
-        disabled={!canInc}
-        hitSlop={8}
-      >
-        <Text style={[styles.stepperBtnText, !canInc && styles.stepperBtnTextDisabled]}>+</Text>
-      </Pressable>
-    </View>
-  );
-}
-
-/**
- * Pill-shaped GNSS status indicator. Always visible at the top of the screen.
- * Color-coded: green = 3D fix, amber = 2D fix, red/gray = no fix.
- */
-function GnssPill({
-  fixType,
-  accuracy,
-  satellitesUsed,
-  satellitesInView,
-  hasFix,
-}: {
-  fixType: GpsFixType;
-  accuracy: number | null;
-  satellitesUsed: number;
-  satellitesInView: number;
-  hasFix: boolean;
-}): React.ReactElement {
-  const color = hasFix
-    ? (fixType === '3D fix' ? COLOR.gnssGreen : COLOR.gnssAmber)
-    : COLOR.gnssRed;
-
-  // Build the detail text: "3D · 4 m · 9 sats" or "no fix · 0/12 sats"
-  let detail: string;
-  if (hasFix) {
-    const parts: string[] = [fixType.toUpperCase()];
-    if (accuracy != null) parts.push(`${accuracy.toFixed(0)} м`);
-    parts.push(`${satellitesUsed} СПУТ`);
-    detail = parts.join(' · ');
-  } else {
-    detail = 'НЕТ СИГНАЛА' + (satellitesInView > 0 ? ` · ${satellitesUsed}/${satellitesInView}` : '');
-  }
-
-  return (
-    <View style={styles.gnssPillWrap}>
-      <View style={[styles.gnssPill, { borderColor: color }]}>
-        <View style={[styles.gnssDot, { backgroundColor: color }]} />
-        <Text style={styles.gnssText}>{detail}</Text>
-      </View>
-    </View>
-  );
-}
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLOR.bg },
@@ -1832,68 +1587,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingTop: 16,
     paddingBottom: 60,
-  },
-  // ---- GNSS pill ----
-  gnssPillWrap: { alignItems: 'center', marginBottom: 24 },
-  gnssPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 20,
-    borderWidth: 1.5,
-    backgroundColor: '#FFFFFF',
-  },
-  gnssDot: {
-    width: 8, height: 8, borderRadius: 4, marginRight: 8,
-  },
-  gnssText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLOR.primary,
-    letterSpacing: 0.8,
-    fontVariant: ['tabular-nums'],
-  },
-  // ---- Big stats ----
-  statBlock: {
-    alignItems: 'center',
-    paddingVertical: 22,
-  },
-  statBlockCompact: {
-    paddingVertical: 16,
-    flex: 1,
-  },
-  statLabel: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: COLOR.secondary,
-    letterSpacing: 2,
-    marginBottom: 8,
-  },
-  statValueRow: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-    gap: 6,
-  },
-  statValue: {
-    fontSize: 64,
-    fontWeight: '700',
-    color: COLOR.primary,
-    fontVariant: ['tabular-nums'],
-    letterSpacing: -1,
-  },
-  statValueCompact: {
-    fontSize: 36,
-  },
-  statUnit: {
-    fontSize: 16,
-    fontWeight: '500',
-    color: COLOR.secondary,
-  },
-  divider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: COLOR.divider,
-    marginVertical: 0,
   },
   twoCol: {
     flexDirection: 'row',
@@ -2083,72 +1776,6 @@ const styles = StyleSheet.create({
   settingGroup: {
     marginBottom: 16,
   },
-  // ---- Stepper row (numeric parameter for the data-reduction filters) ----
-  // Visually attaches to the toggle row above it: same horizontal padding,
-  // same border, same background colour family (so when the toggle is on
-  // the stepper inherits the light-blue tint), rounds only the BOTTOM
-  // corners, no top border (the toggle row already drew it).
-  stepperRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderBottomLeftRadius: 12,
-    borderBottomRightRadius: 12,
-    borderWidth: 1,
-    borderTopWidth: 0,
-    backgroundColor: '#F9FAFB',
-    borderColor: COLOR.divider,
-  },
-  stepperBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: COLOR.divider,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  stepperBtnDisabled: {
-    backgroundColor: '#F3F4F6',
-    borderColor: '#E5E7EB',
-  },
-  stepperBtnText: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: COLOR.primary,
-    lineHeight: 24,
-    textAlign: 'center',
-  },
-  stepperBtnTextDisabled: {
-    color: '#9CA3AF',
-  },
-  stepperValueWrap: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 8,
-  },
-  stepperLabel: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: COLOR.secondary,
-    letterSpacing: 1.5,
-    marginBottom: 2,
-  },
-  stepperValue: {
-    fontSize: 22,
-    fontWeight: '700',
-    color: COLOR.primary,
-    fontVariant: ['tabular-nums'],
-  },
-  stepperUnit: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: COLOR.secondary,
-  },
   // ---- Settings section header + locked badge ----
   settingsHeader: {
     flexDirection: 'row',
@@ -2295,6 +1922,27 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: COLOR.primary,
+  },
+  // O14: full-screen "native module not loaded" fallback.
+  nativeMissingContainer: {
+    flex: 1,
+    backgroundColor: COLOR.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+  },
+  nativeMissingTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: COLOR.errorText,
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  nativeMissingBody: {
+    fontSize: 14,
+    color: COLOR.secondary,
+    textAlign: 'center',
+    lineHeight: 20,
   },
 });
 
