@@ -110,6 +110,8 @@ function App(): React.ReactElement {
   const [lastSavedSettings, setLastSavedSettings] = useState<{
     autoPauseEnabled: boolean;
     gapDetectionEnabled: boolean;
+    // CODE_REVIEW_TODO Task 4: snapshot of showMovingTime at save time.
+    showMovingTime: boolean;
   } | null>(null);
   const [hasPermissions, setHasPermissions] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -120,6 +122,12 @@ function App(): React.ReactElement {
   // Phase 4 toggle: gap detection (signal-loss segment splits). Defaults to
   // true so existing users keep the behaviour from the previous APK.
   const [gapDetectionEnabled, setGapDetectionEnabled] = useState<boolean>(true);
+  // CODE_REVIEW_TODO Task 4: display-only toggle. When ON, the top time
+  // display shows movingMs (active moving time, excludes auto-paused and
+  // signal-lost intervals) and avg pace uses movingMs. When OFF, the UI
+  // shows elapsedMs (wall-clock) — the legacy behaviour. NOT locked while
+  // recording: the user can toggle it any time, including mid-recording.
+  const [showMovingTime, setShowMovingTime] = useState<boolean>(false);
   // Three independent data-reduction filters (user requested). Each has an
   // enabled toggle plus a numeric parameter, exposed via the new
   // setRadialDistanceFilter* / setTimeSampling* / setDouglasPeucker* bridge
@@ -203,6 +211,11 @@ function App(): React.ReactElement {
   // can read it from the (once-set-up) saved-event closure. See the
   // paceTimeMs comment above for why gap detection now also affects pace.
   const gapDetectionEnabledRef = useRef<boolean>(true);
+  // CODE_REVIEW_TODO Task 4: mirror of showMovingTime for use inside the
+  // 'saved' event handler (set up once at mount) so it can read the latest
+  // value at save time without stale-closure issues. Affects which time
+  // base (movingMs vs elapsedMs) is used for the saved-card pace display.
+  const showMovingTimeRef = useRef<boolean>(false);
   // L24 fix: track the last 'duration' event's sequence number so we can
   // ignore out-of-order events (which were causing the displayed timer to
   // occasionally jump backwards by ~1 s when a getState() poll delivered
@@ -212,6 +225,9 @@ function App(): React.ReactElement {
   useEffect(() => { elapsedMsRef.current = elapsedMs; }, [elapsedMs]);
   useEffect(() => { autoPauseEnabledRef.current = autoPauseEnabled; }, [autoPauseEnabled]);
   useEffect(() => { gapDetectionEnabledRef.current = gapDetectionEnabled; }, [gapDetectionEnabled]);
+  // Task 4: keep showMovingTimeRef in sync so the 'saved' handler (set up
+  // once at mount) can read the latest value at save time.
+  useEffect(() => { showMovingTimeRef.current = showMovingTime; }, [showMovingTime]);
   // U10: keep isAutoPausedRef in sync so the 'location' handler (set up once
   // at mount) can read the latest value without stale-closure issues.
   useEffect(() => { isAutoPausedRef.current = isAutoPaused; }, [isAutoPaused]);
@@ -299,6 +315,13 @@ function App(): React.ReactElement {
         try {
           const gd = await GpsRecorder.getGapDetectionEnabled();
           if (mounted) setGapDetectionEnabled(gd);
+        } catch { /* ignore */ }
+
+        // CODE_REVIEW_TODO Task 4: load the show-moving-time display
+        // preference. Default is false (legacy wall-clock display).
+        try {
+          const smt = await GpsRecorder.getShowMovingTimeEnabled();
+          if (mounted) setShowMovingTime(smt);
         } catch { /* ignore */ }
 
         // Load the three data-reduction filter settings from native prefs.
@@ -474,6 +497,10 @@ function App(): React.ReactElement {
         setLastSavedSettings({
           autoPauseEnabled: autoPauseEnabledRef.current,
           gapDetectionEnabled: gapDetectionEnabledRef.current,
+          // CODE_REVIEW_TODO Task 4: also snapshot showMovingTime so the
+          // saved card's pace uses the same time base the user was looking
+          // at when they stopped the recording.
+          showMovingTime: showMovingTimeRef.current,
         });
         setLastSavedPath(ev.filePath);
         // The native side sends the post-save distance (recomputed from the
@@ -803,6 +830,37 @@ function App(): React.ReactElement {
     }
   }, [gapDetectionEnabled, settingsLocked]);
 
+  // CODE_REVIEW_TODO Task 4: toggle the show-moving-time display preference.
+  // Pure display setting — NOT locked while recording (the user can toggle
+  // it any time, including mid-recording). The native side always emits
+  // both elapsedMs and movingMs in every duration / location / state event,
+  // so flipping this setting only changes which value the UI displays on
+  // the next event (1 Hz duration tick). Persisted in the same prefs file
+  // as the other toggles so it survives app restarts and the per-recording
+  // state clear.
+  const handleToggleShowMovingTime = useCallback(async () => {
+    // NOTE: no settingsLocked check — this toggle is intentionally unlocked
+    // during recording per Task 4 spec.
+    if (settingsUpdatingRef.current) return; // U15 shared re-entrancy guard
+    settingsUpdatingRef.current = true;
+    const prev = showMovingTimeRef.current;
+    const next = !prev;
+    setShowMovingTime(next); // optimistic UI update
+    showMovingTimeRef.current = next;
+    try {
+      const confirmed = await GpsRecorder.setShowMovingTimeEnabled(next);
+      setShowMovingTime(confirmed);
+      showMovingTimeRef.current = confirmed;
+    } catch (e: unknown) {
+      // revert on error
+      setShowMovingTime(prev);
+      showMovingTimeRef.current = prev;
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      settingsUpdatingRef.current = false;
+    }
+  }, []);
+
   // ---- Three data-reduction filter toggles + steppers ----
   //
   // Each filter has an enabled toggle (persisted boolean) + a numeric
@@ -965,7 +1023,14 @@ function App(): React.ReactElement {
   // When BOTH settings are off, movingMs equals elapsedMs (no transitions
   // ever fire), so we use elapsedMs directly to avoid the small overhead
   // of the movingMs path.
-  const paceTimeMs = (autoPauseEnabled || gapDetectionEnabled) ? movingMs : elapsedMs;
+  //
+  // CODE_REVIEW_TODO Task 4: when showMovingTime is on, ALWAYS use movingMs
+  // for the pace base (regardless of auto-pause / gap detection state).
+  // This keeps the pace display consistent with the time display, which
+  // also switches to movingMs when the toggle is on.
+  const paceTimeMs = (showMovingTime || autoPauseEnabled || gapDetectionEnabled)
+    ? movingMs
+    : elapsedMs;
   const avgPace = computeAvgPace(paceTimeMs, distance);
 
   // O14: if the native module is not loaded (e.g. package not registered,
@@ -1023,7 +1088,14 @@ function App(): React.ReactElement {
 
         {/* Primary stats: TIME, DISTANCE, PACE, AVG PACE */}
         <BigStat
-          label="ВРЕМЯ"
+          // CODE_REVIEW_TODO Task 4: when showMovingTime is on, the label
+          // changes from "ВРЕМЯ" to "ВРЕМЯ В ДВИЖЕНИИ" so the user knows
+          // the displayed time is the active moving time (excludes
+          // auto-paused and signal-lost intervals), not wall-clock time.
+          // The toggle is NOT locked during recording — the user can flip
+          // it any time and the display switches on the next 1 Hz duration
+          // event.
+          label={showMovingTime ? 'ВРЕМЯ В ДВИЖЕНИИ' : 'ВРЕМЯ'}
           // U22: when auto-paused, prefix the time with "⏸ " so it's
           // crystal clear the displayed time is wall-clock (still ticking)
           // but the recording is paused. The amber colour + the
@@ -1033,7 +1105,18 @@ function App(): React.ReactElement {
           // that ambiguity. (Alternative fix per TODO; the main fix would
           // switch the main timer to movingMs and show both times, but
           // that requires restructuring the BigStat layout.)
-          value={isAutoPaused ? `⏸ ${formatDuration(elapsedMs)}` : formatDuration(elapsedMs)}
+          //
+          // CODE_REVIEW_TODO Task 4: when showMovingTime is on, display
+          // movingMs instead of elapsedMs. While auto-paused, movingMs is
+          // frozen (doesn't tick) — that's the desired behaviour: the user
+          // explicitly asked to see moving time, and during a pause moving
+          // time isn't advancing. The ⏸ prefix is kept for clarity even
+          // though the frozen time itself signals the pause.
+          value={
+            isAutoPaused
+              ? `⏸ ${formatDuration(showMovingTime ? movingMs : elapsedMs)}`
+              : formatDuration(showMovingTime ? movingMs : elapsedMs)
+          }
           // Phase 3: when auto-pause is active, render the TIME value in
           // amber and show a small "ПАУЗА" indicator above it so the user
           // knows the timer is wall-clock but recording is paused.
@@ -1290,6 +1373,48 @@ function App(): React.ReactElement {
           </View>
         </Pressable>
 
+        {/* CODE_REVIEW_TODO Task 4: Show-moving-time display toggle.
+            Pure display preference — NOT locked while recording (the user
+            can toggle it any time, including mid-recording). When ON, the
+            top time display switches from wall-clock elapsed time to
+            active moving time (excludes auto-paused and signal-lost
+            intervals), and the average pace is recomputed from moving
+            time. The native side always emits both values; the UI just
+            chooses which to show. The label above the time changes from
+            "ВРЕМЯ" to "ВРЕМЯ В ДВИЖЕНИИ" as a visual indicator. */}
+        <Pressable
+          style={[
+            styles.toggleRow,
+            showMovingTime ? styles.toggleRowOn : styles.toggleRowOff,
+            // NOTE: no settingsLocked style — this toggle is intentionally
+            // unlocked during recording per Task 4 spec.
+          ]}
+          onPress={handleToggleShowMovingTime}
+          // NOTE: no disabled={settingsLocked} — see comment above.
+        >
+          <View style={styles.toggleLabelWrap}>
+            <Text style={styles.toggleTitle}>Показывать время в движении</Text>
+            <Text style={styles.toggleSubtitle}>
+              {showMovingTime
+                ? 'Включено: верхний таймер и средний темп считаются по чистому времени движения (без учёта пауз и потерь сигнала). Можно менять во время записи.'
+                : 'Выключено: верхний таймер и средний темп считаются по общему времени (включая паузы). Можно менять во время записи.'}
+            </Text>
+          </View>
+          <View
+            style={[
+              styles.toggleSwitch,
+              showMovingTime ? styles.toggleSwitchOn : styles.toggleSwitchOff,
+            ]}
+          >
+            <View
+              style={[
+                styles.toggleKnob,
+                showMovingTime ? styles.toggleKnobOn : styles.toggleKnobOff,
+              ]}
+            />
+          </View>
+        </Pressable>
+
         {/* ---- Three data-reduction filters (user-requested) ---- */}
         {/*
           Each filter is an independent toggle with a numeric parameter. All
@@ -1449,6 +1574,34 @@ function App(): React.ReactElement {
           />
         </View>
 
+        {/* CODE_REVIEW_TODO Task 3: over-filter warning banner.
+            When all three data-reduction filters (radial distance, time
+            sampling, Douglas-Peucker) are enabled simultaneously, the
+            track becomes extremely sparse — for a hiker at 1 m/s, this
+            can lose track corners. The warning is informational only:
+            it does NOT block the user from enabling all three (they may
+            have a legitimate reason, e.g. recording a long bike ride
+            where aggressive simplification is desired). The banner
+            appears directly below the three filter settings and uses
+            the existing amber/warning styling convention (matches the
+            battery-optimization banner). Updates live as toggles flip. */}
+        {radialDistanceFilterEnabled &&
+          timeSamplingEnabled &&
+          douglasPeuckerEnabled && (
+          <View style={styles.overFilterWarningContainer}>
+            <Text style={styles.overFilterWarningTitle}>
+              ⚠ Предупреждение
+            </Text>
+            <Text style={styles.overFilterWarningBody}>
+              Включены все три фильтра прореживания (радиальный, временной,
+              Дуглас-Пекер). Трек может получиться слишком редким, особенно
+              при медленном движении (ходьба, пеший туризм). Углы и повороты
+              могут быть потеряны. Рекомендуется оставить включённым не более
+              двух фильтров одновременно.
+            </Text>
+          </View>
+        )}
+
         {!hasPermissions && (
           <Pressable style={styles.permissionButton} onPress={handleGrantPermissions}>
             <Text style={styles.permissionButtonText}>
@@ -1482,7 +1635,11 @@ function App(): React.ReactElement {
               // card's pace would silently recompute under the new state.
               const ap = lastSavedSettings?.autoPauseEnabled ?? false;
               const gd = lastSavedSettings?.gapDetectionEnabled ?? true;
-              const tMs = (ap || gd)
+              // CODE_REVIEW_TODO Task 4: also use the save-time snapshot of
+              // showMovingTime so the saved card's pace uses the same time
+              // base the user was looking at when they stopped the recording.
+              const smt = lastSavedSettings?.showMovingTime ?? false;
+              const tMs = (smt || ap || gd)
                 ? lastSavedMovingMs
                 : lastSavedElapsedMs;
               const pace = computeAvgPace(tMs, lastSavedDistance);
@@ -1682,6 +1839,35 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     lineHeight: 16,
     textAlign: 'center',
+  },
+  // ---- CODE_REVIEW_TODO Task 3: over-filter warning banner ----
+  // Shown directly below the three data-reduction filter settings when ALL
+  // three are enabled simultaneously. Uses the existing amber palette
+  // (COLOR.pauseBg / pauseBorder / pauseAccent — same as the battery-opt
+  // banner above) for visual consistency with the project's "warning"
+  // convention. The left-border accent + title/body layout mirrors the
+  // signal-lost banner (red variant) for a familiar look.
+  overFilterWarningContainer: {
+    marginTop: 12,
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: COLOR.pauseBg,        // light amber
+    borderLeftWidth: 4,
+    borderLeftColor: COLOR.pauseAccent,    // amber accent stripe
+    borderWidth: 1,
+    borderColor: COLOR.pauseBorder,
+  },
+  overFilterWarningTitle: {
+    color: COLOR.pauseAccent,
+    fontWeight: '700',
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  overFilterWarningBody: {
+    color: COLOR.pauseAccent,
+    fontSize: 13,
+    lineHeight: 18,
   },
   bigButton: {
     width: 220, height: 220, borderRadius: 110,

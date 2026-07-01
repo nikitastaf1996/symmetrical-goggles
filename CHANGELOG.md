@@ -108,3 +108,50 @@ the same cursor, double-counting the dropped step.
 
 **Fix:** the distance is only added to the accumulator when the fix survives
 the radial filter, so the cursor and accumulator always advance together.
+
+---
+
+## Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2)
+
+### Banner flicker on rapid pause/resume oscillation
+
+Borderline cases — very slow walking (~0.3 m/s) with small GPS drift — can
+oscillate in and out of auto-pause at the 10 s sliding-window boundary.
+Each toggle creates a new `<trkseg>` (visible as a segment break in the
+saved GPX), updates the foreground notification, and toggles the amber
+"АВТОПАУЗА" banner on/off. This is technically correct but feels glitchy.
+
+**Fix:** auto-pause exit now requires 3 consecutive "clearly moving" fixes
+before calling `exitAutoPause()`. A fix counts as "clearly moving" if
+either `pt.speed >= 0.5 m/s` (primary) OR the haversine displacement from
+the last kept fix implies a velocity >= 1.5 m/s (fallback for receivers
+that don't populate `Location.speed`). A slow fix resets the counter to 0.
+
+The first 2 confirmation fixes are dropped (not added to the buffer) so
+the post-pause segment starts cleanly at the moment resume is confirmed.
+This loses ~2 s of track data at each resume — an acceptable trade-off.
+
+Auto-pause entry logic is unchanged: "user is stationary for 10 s" still
+triggers `enterAutoPause()` immediately. We only add hysteresis on exit,
+not entry. This is intentional: false positives on entry (pausing when
+the user is actually moving slowly) are worse than false positives on
+exit (taking 3 s longer to resume).
+
+### Auto-pause resume grace window (CODE_REVIEW_TODO Task 1)
+
+When `exitAutoPause()` flips `isAutoPaused = false` during the processing
+of a single fix, the gap-recovery branch at the top of `onLocationChanged`
+had already been evaluated (and skipped) for that fix because
+`isAutoPaused` was still true at evaluation time. On the *next* fix,
+`lastFixTimeMs` may still point to a stale pre-pause value (up to 25 s
+old), so the gap watchdog could falsely declare `signalLost` and the
+gap-recovery branch could falsely trigger a segment split.
+
+**Fix:** `exitAutoPause()` now sets a grace window
+`autoPauseResumeGraceUntilMs = now + GAP_THRESHOLD_MS` and refreshes
+`lastFixTimeMs = now`. Both the gap watchdog in `durationTick` and the
+gap-recovery branch in `onLocationChanged` check the grace window and
+skip their firing logic while it's active. The grace window is persisted
+in the live-state bundle so it survives service restart; on recovery,
+if the grace has already expired, it's reset to 0L.
+

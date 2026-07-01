@@ -83,8 +83,11 @@ android {
         applicationId "com.gpsrecorder"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 2
-        versionName "1.1"
+        // CODE_REVIEW_TODO Tasks 1-5: bump versionCode 2 -> 3, versionName
+        // 1.1 -> 1.2 per AGENTS.md O25 (Android refuses sideloaded-APK
+        // upgrades when versionCode does not strictly increase).
+        versionCode 3
+        versionName "1.2"
     }
     signingConfigs {
         debug {
@@ -120,4 +123,15 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // ---- Unit tests (CODE_REVIEW_TODO Task 1) ----
+    // Plain JUnit4 + a tiny pure-Kotlin helper for the gap/pause race
+    // invariant. Robolectric is intentionally NOT added so the tests run
+    // on a stock JDK without the Android framework — they exercise a
+    // small state-machine class that mirrors the relevant fields of
+    // GpsRecorderService (isAutoPaused, signalLost, lastFixTimeMs,
+    // autoPauseResumeGraceUntilMs) without depending on Service /
+    // SharedPreferences / LocationListener.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlin:kotlin-test:2.1.20")
 }

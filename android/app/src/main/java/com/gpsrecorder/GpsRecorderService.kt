@@ -187,10 +187,51 @@ class GpsRecorderService : Service(), LocationListener {
         // urban GPS noise bubble when standing still.
         private const val AUTO_PAUSE_DISPLACEMENT_THRESHOLD_M = 3.5
 
+        // ---- Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2) ----
+        // To prevent the amber "АВТОПАУЗА" banner from flickering on rapid
+        // pause/resume oscillation (e.g. very slow walking ~0.3 m/s with
+        // small GPS drift can oscillate in and out of auto-pause at the 10 s
+        // window boundary), we require N consecutive "clearly moving" fixes
+        // before calling exitAutoPause(). A fix counts as "clearly moving"
+        // if either:
+        //   - pt.speed >= HYSTERESIS_SPEED_MS, OR
+        //   - pt.speed is null/0 AND the haversine distance from the last
+        //     kept fix implies a velocity >= 1.5 m/s over the dt.
+        // A slow fix (< HYSTERESIS_SPEED_MS) resets the counter to 0.
+        //
+        // The first (MOVING_CONFIRMATION_THRESHOLD - 1) confirmation fixes
+        // are dropped (not added to the buffer) so the post-pause segment
+        // starts cleanly at the moment resume is confirmed. This loses ~2
+        // seconds of track data at each resume — an acceptable trade-off
+        // per CODE_REVIEW_TODO Task 2.
+        private const val MOVING_CONFIRMATION_THRESHOLD = 3   // consecutive fixes
+        private const val HYSTERESIS_SPEED_MS = 0.5f          // 0.5 m/s ≈ slow walk
+        private const val HYSTERESIS_DISPLACEMENT_MPS = 1.5   // fallback when speed is null/0
+        private const val KEY_CONSECUTIVE_MOVING_FIXES = "consecutive_moving_fixes"
+
         // ---- Gap detection (signal loss) (Phase 4) ----
         // If no GPS fix arrives for this many ms, declare a signal gap and
         // split the track into a new <trkseg> when the next fix does arrive.
         private const val GAP_THRESHOLD_MS = 15_000L
+
+        // ---- Auto-pause resume grace window (CODE_REVIEW_TODO Task 1) ----
+        // After exitAutoPause(), `lastFixTimeMs` may be stale (last updated
+        // while the user was stationary under auto-pause, so it points to a
+        // fix that is up to AUTO_PAUSE_RAW_WINDOW_MS old). The gap watchdog
+        // (durationTick, 1 Hz) and the gap-recovery branch in onLocationChanged
+        // both compare `now - lastFixTimeMs` against GAP_THRESHOLD_MS — if we
+        // let them run immediately after resume, they could falsely declare
+        // signalLost or trigger a spurious segment split.
+        //
+        // The grace window suppresses both checks for GAP_THRESHOLD_MS after
+        // every exitAutoPause(). exitAutoPause() also refreshes lastFixTimeMs
+        // to the resume fix so the watchdog's next tick sees a recent fix
+        // even if no further fix arrives.
+        //
+        // Persisted in the live-state bundle (KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS)
+        // so it survives service restart. On recovery, if the grace has
+        // already expired (grace < now), it is reset to 0L.
+        private const val KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS = "auto_pause_resume_grace_until_ms"
 
         // ---- Radial-distance on-the-fly filter (defaults; user-tunable) ----
         // Prefs keys + defaults are owned by GpsRecorderModule, but the
@@ -318,6 +359,24 @@ class GpsRecorderService : Service(), LocationListener {
     @Volatile private var movingMs: Long = 0L
     @Volatile private var lastResumeMs: Long? = null
 
+    // ---- Auto-pause resume grace window (CODE_REVIEW_TODO Task 1) ----
+    // While System.currentTimeMillis() < autoPauseResumeGraceUntilMs, the gap
+    // watchdog (durationTick) and the gap-recovery branch in onLocationChanged
+    // MUST NOT fire. Set by exitAutoPause() to (now + GAP_THRESHOLD_MS) so a
+    // stale lastFixTimeMs (left over from when the user was stationary) can't
+    // trigger a false signalLost declaration or a spurious segment split in
+    // the GAP_THRESHOLD_MS window immediately after resume.
+    @Volatile private var autoPauseResumeGraceUntilMs: Long = 0L
+
+    // ---- Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2) ----
+    // Counts consecutive "clearly moving" fixes while isAutoPaused. When it
+    // reaches MOVING_CONFIRMATION_THRESHOLD, exitAutoPause() fires and the
+    // counter resets to 0. A slow fix (< HYSTERESIS_SPEED_MS) resets it.
+    // Persisted in the live-state bundle so a service restart mid-confirmation
+    // doesn't lose progress (the user just has to re-confirm 3 fixes —
+    // acceptable per Task 2).
+    @Volatile private var consecutiveMovingFixes: Int = 0
+
     // ---- Time-sampling on-the-fly filter state ----
     // Monotonic counter incremented for EVERY fix that arrives (after the
     // stale-fix / gap / auto-pause checks). When time_sampling_enabled is
@@ -395,7 +454,19 @@ class GpsRecorderService : Service(), LocationListener {
                 // legitimately have no incoming fixes (Android throttles
                 // updates), so showing the signal-lost banner on top of the
                 // auto-pause banner would be contradictory. See CHANGELOG.md.
-                if (isGapDetectionEnabled() && !signalLost && !isAutoPaused && lastFixTimeMs > 0L) {
+                //
+                // CODE_REVIEW_TODO Task 1: also suppress while inside the
+                // auto-pause resume grace window. exitAutoPause() sets
+                // autoPauseResumeGraceUntilMs = now + GAP_THRESHOLD_MS and
+                // refreshes lastFixTimeMs to the resume fix, but if no
+                // further fix arrives in the next 15 s (e.g. the user took
+                // one step and then stood still again), the watchdog would
+                // see `now - lastFixTimeMs > GAP_THRESHOLD_MS` and falsely
+                // declare signalLost. The grace window makes the invariant
+                // explicit and refactor-proof.
+                if (isGapDetectionEnabled() && !signalLost && !isAutoPaused
+                    && now >= autoPauseResumeGraceUntilMs   // Task 1
+                    && lastFixTimeMs > 0L) {
                     val sinceLast = now - lastFixTimeMs
                     if (sinceLast > GAP_THRESHOLD_MS) {
                         signalLost = true
@@ -556,6 +627,13 @@ class GpsRecorderService : Service(), LocationListener {
             // Phase 6: reset moving-time accumulator.
             movingMs = 0L
             lastResumeMs = startTimeMs
+            // CODE_REVIEW_TODO Task 1: reset the auto-pause resume grace
+            // window so a fresh recording doesn't inherit a stale grace
+            // from a previous session.
+            autoPauseResumeGraceUntilMs = 0L
+            // CODE_REVIEW_TODO Task 2: reset the moving-confirmation counter
+            // so a fresh recording starts the hysteresis window from 0.
+            consecutiveMovingFixes = 0
             // Reset the time-sampling counter so the new recording starts at
             // fix #1 (which is always kept under any N because 1 % N != 0 is
             // false only for N=1; we treat the very first fix specially — see
@@ -1115,6 +1193,13 @@ class GpsRecorderService : Service(), LocationListener {
                 .putBoolean(KEY_IS_AUTO_PAUSED, isAutoPaused)
                 .putBoolean(KEY_SIGNAL_LOST, signalLost)
                 .putLong(KEY_MOVING_MS, movingMs)
+                // CODE_REVIEW_TODO Task 1: persist the grace window here too
+                // so a service restart mid-grace still honors it.
+                .putLong(KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS, autoPauseResumeGraceUntilMs)
+                // CODE_REVIEW_TODO Task 2: persist the moving-confirmation
+                // counter so a service restart mid-confirmation doesn't
+                // lose progress.
+                .putInt(KEY_CONSECUTIVE_MOVING_FIXES, consecutiveMovingFixes)
                 .apply()
         } catch (e: Exception) {
             Log.w(TAG, "persistAutoPauseState failed", e)
@@ -1140,6 +1225,10 @@ class GpsRecorderService : Service(), LocationListener {
             if (now > r) movingMs += (now - r)
         }
         lastResumeMs = null
+        // CODE_REVIEW_TODO Task 2: reset the moving-confirmation counter so
+        // the next resume requires a fresh run of MOVING_CONFIRMATION_THRESHOLD
+        // consecutive fast fixes.
+        consecutiveMovingFixes = 0
         persistAutoPauseState()
         updateNotification()
         Log.i(TAG, "Auto-pause entered at $now (movingMs=$movingMs)")
@@ -1175,15 +1264,36 @@ class GpsRecorderService : Service(), LocationListener {
      * Exits auto-pause: starts a new segment for the post-pause data,
      * resets the validation cursor so the first post-pause fix isn't dropped
      * by the velocity gate, and resumes the moving-time accumulator.
+     *
+     * CODE_REVIEW_TODO Task 1: also sets a "just resumed from auto-pause"
+     * grace window of GAP_THRESHOLD_MS during which the gap watchdog and the
+     * gap-recovery branch MUST NOT fire. Without this, the watchdog's next
+     * 1 Hz tick could compare `now - lastFixTimeMs` against GAP_THRESHOLD_MS
+     * using a stale `lastFixTimeMs` (last updated while the user was
+     * stationary) and falsely declare signalLost — see CHANGELOG.md /
+     * CODE_REVIEW_TODO Task 1 for the full race scenario.
+     *
+     * We also refresh `lastFixTimeMs` to the resume fix timestamp so the
+     * watchdog's next tick sees a recent fix even if no further fix arrives
+     * in the next 15 s (e.g. the user takes one step and then stands still
+     * again — the auto-pause path will re-engage via enterAutoPause() before
+     * the grace window expires, but if it doesn't, the watchdog should still
+     * not fire falsely).
      */
     private fun exitAutoPause(now: Long) {
         isAutoPaused = false
         resetValidationCursor()
         createNewSegment()  // no-op if currentSegment is empty (typical case)
         lastResumeMs = now
+        // CODE_REVIEW_TODO Task 1: grace window + lastFixTimeMs refresh.
+        autoPauseResumeGraceUntilMs = now + GAP_THRESHOLD_MS
+        lastFixTimeMs = now
+        // CODE_REVIEW_TODO Task 2: reset the moving-confirmation counter so
+        // the next auto-pause cycle starts fresh.
+        consecutiveMovingFixes = 0
         persistAutoPauseState()
         updateNotification()
-        Log.i(TAG, "Auto-pause exited at $now (movingMs=$movingMs)")
+        Log.i(TAG, "Auto-pause exited at $now (movingMs=$movingMs, graceUntil=$autoPauseResumeGraceUntilMs)")
     }
 
     /**
@@ -1266,7 +1376,21 @@ class GpsRecorderService : Service(), LocationListener {
         // incoming fixes by design, and the current segment was already
         // finalized on auto-pause entry. Running handleGapRecovery here
         // would create spurious 1-point segments in the GPX. See CHANGELOG.md.
-        if (isGapDetectionEnabled() && !isAutoPaused) {
+        //
+        // CODE_REVIEW_TODO Task 1: also skip while inside the auto-pause
+        // resume grace window. The resume fix itself arrives with
+        // isAutoPaused already flipped to false (exitAutoPause ran earlier
+        // in this same onLocationChanged call), so without the grace check
+        // this branch would compare `pt.timeMs - lastFixTimeMs` (which
+        // exitAutoPause just refreshed to `pt.timeMs`, so the diff is 0)
+        // — but on the NEXT fix, if the user stood still for ~25 s before
+        // resuming, lastFixTimeMs may still point to a stale pre-pause
+        // value and the diff would exceed GAP_THRESHOLD_MS, falsely
+        // triggering a segment split. The grace check makes the invariant
+        // explicit.
+        if (isGapDetectionEnabled() && !isAutoPaused
+            && pt.timeMs >= autoPauseResumeGraceUntilMs   // Task 1
+        ) {
             val gapDetected = lastFixTimeMs > 0L && (pt.timeMs - lastFixTimeMs) > GAP_THRESHOLD_MS
             if (gapDetected || signalLost) {
                 Log.i(
@@ -1326,6 +1450,14 @@ class GpsRecorderService : Service(), LocationListener {
                     )
                     enterAutoPause(pt.timeMs)
                 }
+                // CODE_REVIEW_TODO Task 2: a stationary fix while paused
+                // resets the moving-confirmation counter (the user has to
+                // re-accumulate MOVING_CONFIRMATION_THRESHOLD consecutive
+                // fast fixes to resume). enterAutoPause() also resets it,
+                // but we reset here too so a slow fix during the
+                // confirmation window — without re-entering pause — also
+                // resets the counter.
+                if (isAutoPaused) consecutiveMovingFixes = 0
                 // While paused: do NOT add the point to the buffer and do NOT
                 // accumulate distance. But DO update lastFixTimeMs and live
                 // state so the UI knows we still have a fix (and isn't fooled
@@ -1341,14 +1473,96 @@ class GpsRecorderService : Service(), LocationListener {
             } else {
                 // User is moving.
                 if (isAutoPaused) {
-                    Log.i(
-                        TAG,
-                        "Auto-pause resuming: speed=${pt.speed} disp=${disp}m window=${rawWindow.size}"
-                    )
-                    exitAutoPause(pt.timeMs)
-                    // After exitAutoPause, prevLat is null, so the velocity
-                    // gate below will naturally let this first post-pause fix
-                    // through without being dropped (no dt to compute).
+                    // CODE_REVIEW_TODO Task 2: hysteresis — require
+                    // MOVING_CONFIRMATION_THRESHOLD consecutive "clearly
+                    // moving" fixes before resuming. This prevents the
+                    // amber "АВТОПАУЗА" banner from flickering on rapid
+                    // pause/resume oscillation (e.g. very slow walking
+                    // ~0.3 m/s with GPS drift can oscillate at the 10 s
+                    // window boundary). Each flicker creates a new <trkseg>
+                    // and toggles the notification / banner — technically
+                    // correct but feels glitchy.
+                    //
+                    // A fix counts as "clearly moving" if EITHER:
+                    //   - pt.speed >= HYSTERESIS_SPEED_MS (primary), OR
+                    //   - pt.speed is null/0 AND haversine displacement
+                    //     from the last kept fix implies velocity >=
+                    //     HYSTERESIS_DISPLACEMENT_MPS (fallback for
+                    //     receivers that don't populate Location.speed).
+                    //
+                    // The first (MOVING_CONFIRMATION_THRESHOLD - 1)
+                    // confirmation fixes are dropped (same pattern as the
+                    // stopped branch above) so the post-pause segment
+                    // starts cleanly at the moment resume is confirmed.
+                    // This loses ~2 s of track data at each resume —
+                    // acceptable per Task 2.
+                    val speedBased = pt.speed != null && pt.speed >= HYSTERESIS_SPEED_MS
+                    val dispBased = (!speedBased && (pt.speed == null || pt.speed == 0f)) && run {
+                        val pLat = prevLat
+                        val pLon = prevLon
+                        val pTime = prevTimeMs
+                        if (pLat != null && pLon != null && pTime != null) {
+                            val dtSec = (pt.timeMs - pTime) / 1000.0
+                            if (dtSec > 0) {
+                                val d = TrackMath.haversineMeters(pLat, pLon, pt.lat, pt.lon)
+                                (d / dtSec) >= HYSTERESIS_DISPLACEMENT_MPS
+                            } else false
+                        } else false
+                    }
+                    if (speedBased || dispBased) {
+                        consecutiveMovingFixes++
+                        if (consecutiveMovingFixes >= MOVING_CONFIRMATION_THRESHOLD) {
+                            Log.i(
+                                TAG,
+                                "Auto-pause resuming after $consecutiveMovingFixes confirmation fixes:" +
+                                    " speed=${pt.speed} disp=${disp}m window=${rawWindow.size}"
+                            )
+                            exitAutoPause(pt.timeMs)
+                            // ← fall through; this fix is added to the new
+                            // post-resume segment (exitAutoPause called
+                            // createNewSegment above).
+                        } else {
+                            // Confirmation in progress — still auto-paused.
+                            // Drop the fix (same pattern as the stopped
+                            // branch) so the buffer stays clean until the
+                            // resume is confirmed. The UI still gets the
+                            // location event so the user sees their
+                            // current position update.
+                            Log.i(
+                                TAG,
+                                "Auto-pause confirmation $consecutiveMovingFixes/$MOVING_CONFIRMATION_THRESHOLD:" +
+                                    " speed=${pt.speed} disp=${disp}m — staying paused"
+                            )
+                            lastFixTimeMs = pt.timeMs
+                            saveLiveState(pt)
+                            GpsRecorderModule.emitLocation(
+                                pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                                computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                                isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                            )
+                            return
+                        }
+                    } else {
+                        // User moved a little but not clearly enough to
+                        // count toward resume confirmation. Reset the
+                        // counter and stay paused. Drop the fix.
+                        if (consecutiveMovingFixes > 0) {
+                            Log.i(
+                                TAG,
+                                "Auto-pause confirmation reset (was $consecutiveMovingFixes):" +
+                                    " speed=${pt.speed} disp=${disp}m — staying paused"
+                            )
+                        }
+                        consecutiveMovingFixes = 0
+                        lastFixTimeMs = pt.timeMs
+                        saveLiveState(pt)
+                        GpsRecorderModule.emitLocation(
+                            pt.lat, pt.lon, pt.alt, pt.speed, pt.accuracy,
+                            computeFixType(), totalDistanceM, pt.timeMs, pointCount,
+                            isAutoPaused, signalLost, liveMovingMs(pt.timeMs)
+                        )
+                        return
+                    }
                 }
             }
         }
@@ -1833,6 +2047,16 @@ class GpsRecorderService : Service(), LocationListener {
             // from after a service restart (see recoverStateIfAny).
             val liveNow = lastFix?.timeMs ?: now
             prefs.putLong(KEY_MOVING_MS, liveMovingMs(liveNow))
+            // CODE_REVIEW_TODO Task 1: persist the auto-pause resume grace
+            // window so it survives service restart. If the grace has
+            // already expired by the time we recover, recoverStateIfAny
+            // resets it to 0L.
+            prefs.putLong(KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS, autoPauseResumeGraceUntilMs)
+            // CODE_REVIEW_TODO Task 2: persist the moving-confirmation counter
+            // so a service restart mid-confirmation doesn't lose progress.
+            // (If the service restarts mid-confirmation, the user has to
+            // re-confirm 3 fixes — acceptable per Task 2.)
+            prefs.putInt(KEY_CONSECUTIVE_MOVING_FIXES, consecutiveMovingFixes)
             val fix = lastFix ?: synchronized(pointBufferLock) { currentSegment.lastOrNull() }
             if (fix != null) {
                 prefs.putString(KEY_LAST_LAT, fix.lat.toString())
@@ -3015,6 +3239,23 @@ class GpsRecorderService : Service(), LocationListener {
             isAutoPaused = prefs.getBoolean(KEY_IS_AUTO_PAUSED, false)
             signalLost = prefs.getBoolean(KEY_SIGNAL_LOST, false)
             movingMs = prefs.getLong(KEY_MOVING_MS, 0L)
+            // CODE_REVIEW_TODO Task 1: recover the auto-pause resume grace
+            // window. If the grace has already expired by the time we
+            // recover, reset it to 0L so the gap watchdog / gap-recovery
+            // branch can fire normally again. (A service restart that
+            // happens mid-grace will still honor the remaining window —
+            // this is the safe choice because the race the grace protects
+            // against is most acute in the first few seconds after resume.)
+            val recoveredGrace = prefs.getLong(KEY_AUTO_PAUSE_RESUME_GRACE_UNTIL_MS, 0L)
+            autoPauseResumeGraceUntilMs =
+                if (recoveredGrace > 0L && recoveredGrace > System.currentTimeMillis()) recoveredGrace else 0L
+            // CODE_REVIEW_TODO Task 2: recover the moving-confirmation counter.
+            // If we were auto-paused when the service was killed, the
+            // counter is whatever it was at the last persistAutoPauseState()
+            // call. We keep it so the user doesn't have to start over (but
+            // they still need to reach MOVING_CONFIRMATION_THRESHOLD
+            // consecutive fast fixes to resume).
+            consecutiveMovingFixes = prefs.getInt(KEY_CONSECUTIVE_MOVING_FIXES, 0)
             // If we were not auto-paused when the service was killed, treat
             // the resume instant as the start of a new moving segment so
             // movingMs accumulates correctly going forward. (If we were
@@ -3025,7 +3266,9 @@ class GpsRecorderService : Service(), LocationListener {
                 TAG,
                 "Recovered recording state: start=$startTimeMs count=$pointCount" +
                     " temp=$tempFileName dist=$totalDistanceM" +
-                    " autoPaused=$isAutoPaused signalLost=$signalLost movingMs=$movingMs"
+                    " autoPaused=$isAutoPaused signalLost=$signalLost movingMs=$movingMs" +
+                    " graceUntil=$autoPauseResumeGraceUntilMs" +
+                    " consecutiveMovingFixes=$consecutiveMovingFixes"
             )
             // Try to reload buffered points from the temp file (multi-segment aware).
             reloadPointsFromTempFile()

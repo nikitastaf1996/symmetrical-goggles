@@ -160,6 +160,15 @@ type GpsRecorderNativeType = {
   // signal-lost UI banner never appears.
   setGapDetectionEnabled(enabled: boolean): Promise<boolean>;
   getGapDetectionEnabled(): Promise<boolean>;
+  // CODE_REVIEW_TODO Task 4: display-only toggle. When ON, the JS UI
+  // shows movingMs (active moving time, excludes auto-paused and signal-
+  // lost intervals) in the top time display and computes avg pace from
+  // movingMs. When OFF, the UI shows elapsedMs (wall-clock) — the legacy
+  // behaviour. Persisted in the same prefs file as the other toggles.
+  // NOT locked while recording — the user can toggle it any time, including
+  // mid-recording. Default false.
+  setShowMovingTimeEnabled(enabled: boolean): Promise<boolean>;
+  getShowMovingTimeEnabled(): Promise<boolean>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -204,6 +213,9 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   getAutoPauseEnabled: async () => false,
   setGapDetectionEnabled: async (_enabled: boolean) => false,
   getGapDetectionEnabled: async () => true,
+  // Task 4 fallback: default false (legacy wall-clock display).
+  setShowMovingTimeEnabled: async (_enabled: boolean) => false,
+  getShowMovingTimeEnabled: async () => false,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -238,6 +250,9 @@ export const GpsRecorder = {
   getAutoPauseEnabled: () => NativeGpsRecorder.getAutoPauseEnabled(),
   setGapDetectionEnabled: (enabled: boolean) => NativeGpsRecorder.setGapDetectionEnabled(enabled),
   getGapDetectionEnabled: () => NativeGpsRecorder.getGapDetectionEnabled(),
+  // Task 4: display-only toggle.
+  setShowMovingTimeEnabled: (enabled: boolean) => NativeGpsRecorder.setShowMovingTimeEnabled(enabled),
+  getShowMovingTimeEnabled: () => NativeGpsRecorder.getShowMovingTimeEnabled(),
 };
 
 /**

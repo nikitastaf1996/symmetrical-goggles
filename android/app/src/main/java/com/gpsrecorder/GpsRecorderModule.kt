@@ -58,6 +58,8 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  *   - getAutoPauseEnabled()        -> Promise<Boolean>
  *   - setGapDetectionEnabled(b)    -> Promise<Boolean> (gap detection on signal loss)
  *   - getGapDetectionEnabled()     -> Promise<Boolean>
+ *   - setShowMovingTimeEnabled(b)  -> Promise<Boolean> (display: show moving time vs total)
+ *   - getShowMovingTimeEnabled()   -> Promise<Boolean>
  *   - startGnssMonitor()           -> Promise<Boolean> (always-on GNSS status)
  *   - stopGnssMonitor()            -> Promise<Boolean>
  *   - addListener(String)          -> required by NativeEventEmitter
@@ -865,6 +867,44 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
             promise.resolve(settingsPrefs().getBoolean("gap_detection_enabled", true))
         } catch (e: Exception) {
             promise.reject("E_SETTINGS", e.message ?: "getGapDetectionEnabled error", e)
+        }
+    }
+
+    // ---- Show-moving-time display toggle (CODE_REVIEW_TODO Task 4) ----
+    //
+    // Pure display preference: when ON, the JS UI shows movingMs (active
+    // moving time, excludes auto-paused and signal-lost intervals) in the
+    // top time display and computes avg pace from movingMs. When OFF, the
+    // UI shows elapsedMs (wall-clock) — the legacy behaviour.
+    //
+    // The native side ALWAYS emits both elapsedMs and movingMs in every
+    // duration / location / state event, so this toggle does not affect
+    // what gets recorded — only what the UI chooses to display. It is
+    // NOT locked while a recording is in progress (the user can toggle
+    // it any time, including mid-recording).
+    //
+    // Persisted in the same "gps_recorder_settings" prefs file as the
+    // other display / filter toggles so it survives the per-recording
+    // state clear. Default false: existing users keep the legacy
+    // wall-clock time display after upgrading.
+
+    @ReactMethod
+    fun setShowMovingTimeEnabled(enabled: Boolean, promise: Promise) {
+        try {
+            settingsPrefs().edit().putBoolean("show_moving_time_enabled", enabled).apply()
+            Log.i(TAG, "Show-moving-time enabled = $enabled")
+            promise.resolve(enabled)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setShowMovingTimeEnabled error", e)
+        }
+    }
+
+    @ReactMethod
+    fun getShowMovingTimeEnabled(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getBoolean("show_moving_time_enabled", false))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getShowMovingTimeEnabled error", e)
         }
     }
 
