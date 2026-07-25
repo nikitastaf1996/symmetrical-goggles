@@ -153,4 +153,20 @@ object GpsRecorderSettings {
      */
     fun isShowMovingTimeEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_SHOW_MOVING_TIME_ENABLED, false)
+
+    // ---- Auto-pause variables (exposed to user) ----
+
+    fun getAutoPauseSpeedThresholdMps(context: Context): Float {
+        val s = prefs(context).getString("auto_pause_speed_threshold_mps", null)
+        return s?.toFloatOrNull() ?: 0.35f
+    }
+
+    fun getAutoPauseDisplacementThresholdM(context: Context): Float {
+        val s = prefs(context).getString("auto_pause_displacement_threshold_m", null)
+        return s?.toFloatOrNull() ?: 3.5f
+    }
+
+    fun getAutoPauseWindowMs(context: Context): Long {
+        return prefs(context).getInt("auto_pause_window_ms", 10000).toLong()
+    }
 }

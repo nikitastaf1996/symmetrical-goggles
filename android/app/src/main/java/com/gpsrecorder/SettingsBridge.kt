@@ -360,6 +360,69 @@ class SettingsBridge(private val reactContext: ReactApplicationContext) {
         }
     }
 
+    // ---- Auto-pause variables (exposed to user as text inputs) ----
+
+    fun setAutoPauseSpeedThresholdMps(threshold: Double, promise: Promise) {
+        try {
+            val clamped = threshold.coerceIn(0.0, 5.0)
+            settingsPrefs().edit().putString("auto_pause_speed_threshold_mps", clamped.toString()).apply()
+            Log.i(TAG, "Auto-pause speed threshold = $clamped m/s")
+            promise.resolve(clamped)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setAutoPauseSpeedThresholdMps error", e)
+        }
+    }
+
+    fun getAutoPauseSpeedThresholdMps(promise: Promise) {
+        try {
+            val s = settingsPrefs().getString("auto_pause_speed_threshold_mps", null)
+            val v = s?.toDoubleOrNull() ?: 0.35
+            promise.resolve(v)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getAutoPauseSpeedThresholdMps error", e)
+        }
+    }
+
+    fun setAutoPauseDisplacementThresholdM(threshold: Double, promise: Promise) {
+        try {
+            val clamped = threshold.coerceIn(0.0, 50.0)
+            settingsPrefs().edit().putString("auto_pause_displacement_threshold_m", clamped.toString()).apply()
+            Log.i(TAG, "Auto-pause displacement threshold = $clamped m")
+            promise.resolve(clamped)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setAutoPauseDisplacementThresholdM error", e)
+        }
+    }
+
+    fun getAutoPauseDisplacementThresholdM(promise: Promise) {
+        try {
+            val s = settingsPrefs().getString("auto_pause_displacement_threshold_m", null)
+            val v = s?.toDoubleOrNull() ?: 3.5
+            promise.resolve(v)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getAutoPauseDisplacementThresholdM error", e)
+        }
+    }
+
+    fun setAutoPauseWindowMs(windowMs: Int, promise: Promise) {
+        try {
+            val clamped = windowMs.coerceIn(1000, 60000)
+            settingsPrefs().edit().putInt("auto_pause_window_ms", clamped).apply()
+            Log.i(TAG, "Auto-pause window = $clamped ms")
+            promise.resolve(clamped)
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "setAutoPauseWindowMs error", e)
+        }
+    }
+
+    fun getAutoPauseWindowMs(promise: Promise) {
+        try {
+            promise.resolve(settingsPrefs().getInt("auto_pause_window_ms", 10000))
+        } catch (e: Exception) {
+            promise.reject("E_SETTINGS", e.message ?: "getAutoPauseWindowMs error", e)
+        }
+    }
+
     private companion object {
         private const val TAG = "SettingsBridge"
     }

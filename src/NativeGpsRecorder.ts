@@ -169,6 +169,13 @@ type GpsRecorderNativeType = {
   // mid-recording. Default false.
   setShowMovingTimeEnabled(enabled: boolean): Promise<boolean>;
   getShowMovingTimeEnabled(): Promise<boolean>;
+  // Auto-pause variables (exposed to user as text inputs, not +/−)
+  setAutoPauseSpeedThresholdMps(threshold: number): Promise<number>;
+  getAutoPauseSpeedThresholdMps(): Promise<number>;
+  setAutoPauseDisplacementThresholdM(threshold: number): Promise<number>;
+  getAutoPauseDisplacementThresholdM(): Promise<number>;
+  setAutoPauseWindowMs(windowMs: number): Promise<number>;
+  getAutoPauseWindowMs(): Promise<number>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 };
@@ -216,6 +223,12 @@ const NativeGpsRecorder = (NativeModules.GpsRecorder as GpsRecorderNativeType) |
   // Task 4 fallback: default false (legacy wall-clock display).
   setShowMovingTimeEnabled: async (_enabled: boolean) => false,
   getShowMovingTimeEnabled: async () => false,
+  setAutoPauseSpeedThresholdMps: async (_threshold: number) => 0.35,
+  getAutoPauseSpeedThresholdMps: async () => 0.35,
+  setAutoPauseDisplacementThresholdM: async (_threshold: number) => 3.5,
+  getAutoPauseDisplacementThresholdM: async () => 3.5,
+  setAutoPauseWindowMs: async (_windowMs: number) => 10000,
+  getAutoPauseWindowMs: async () => 10000,
   addListener: () => {},
   removeListeners: () => {},
 };
@@ -253,6 +266,12 @@ export const GpsRecorder = {
   // Task 4: display-only toggle.
   setShowMovingTimeEnabled: (enabled: boolean) => NativeGpsRecorder.setShowMovingTimeEnabled(enabled),
   getShowMovingTimeEnabled: () => NativeGpsRecorder.getShowMovingTimeEnabled(),
+  setAutoPauseSpeedThresholdMps: (threshold: number) => NativeGpsRecorder.setAutoPauseSpeedThresholdMps(threshold),
+  getAutoPauseSpeedThresholdMps: () => NativeGpsRecorder.getAutoPauseSpeedThresholdMps(),
+  setAutoPauseDisplacementThresholdM: (threshold: number) => NativeGpsRecorder.setAutoPauseDisplacementThresholdM(threshold),
+  getAutoPauseDisplacementThresholdM: () => NativeGpsRecorder.getAutoPauseDisplacementThresholdM(),
+  setAutoPauseWindowMs: (windowMs: number) => NativeGpsRecorder.setAutoPauseWindowMs(windowMs),
+  getAutoPauseWindowMs: () => NativeGpsRecorder.getAutoPauseWindowMs(),
 };
 
 /**

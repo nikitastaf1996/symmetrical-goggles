@@ -45,7 +45,8 @@ class AutoPauseHandler internal constructor(
         if (!GpsRecorderSettings.isAutoPauseEnabled(service)) return false
         // Push to sliding raw window and prune entries older than the window.
         service.rawWindow.add(pt)
-        val windowCutoff = pt.timeMs - AutoPauseGapController.RAW_WINDOW_MS
+        val windowMs = AutoPauseGapController.windowMs(service)
+        val windowCutoff = pt.timeMs - windowMs
         while (service.rawWindow.isNotEmpty() && service.rawWindow.peek()!!.timeMs < windowCutoff) {
             service.rawWindow.poll()
         }
@@ -58,9 +59,11 @@ class AutoPauseHandler internal constructor(
         // was moving. We now treat a null speed as 'not stationary' so
         // the displacement check (line below) is the sole backstop —
         // exactly what we want when the GPS can't tell us our speed.
-        val speedOk = pt.speed?.let { it < AutoPauseGapController.SPEED_THRESHOLD_MPS } ?: false
+        val speedThreshold = AutoPauseGapController.speedThreshold(service)
+        val speedOk = pt.speed?.let { it < speedThreshold } ?: false
+        val dispThreshold = AutoPauseGapController.displacementThreshold(service)
         val disp = service.autoPauseGap.maxDisplacementInWindow()
-        val dispOk = disp < AutoPauseGapController.DISPLACEMENT_THRESHOLD_M
+        val dispOk = disp < dispThreshold
         val stopped = speedOk && dispOk
 
         if (stopped) {

@@ -46,6 +46,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { GnssPill } from './src/components/GnssPill';
 import { ToggleRow } from './src/components/ToggleRow';
 import { FilterSettingGroup } from './src/components/FilterSettingGroup';
+import { TextInputRow } from './src/components/TextInputRow';
 import { StatsDisplay } from './src/components/StatsDisplay';
 import { StartStopButton } from './src/components/StartStopButton';
 import { SavedCard } from './src/components/SavedCard';
@@ -111,6 +112,9 @@ function App(): React.ReactElement {
   const timeSamplingN = useSettingsStore((s) => s.timeSamplingN);
   const douglasPeuckerEnabled = useSettingsStore((s) => s.douglasPeuckerEnabled);
   const douglasPeuckerEpsilonM = useSettingsStore((s) => s.douglasPeuckerEpsilonM);
+  const autoPauseSpeedThresholdMps = useSettingsStore((s) => s.autoPauseSpeedThresholdMps);
+  const autoPauseDisplacementThresholdM = useSettingsStore((s) => s.autoPauseDisplacementThresholdM);
+  const autoPauseWindowMs = useSettingsStore((s) => s.autoPauseWindowMs);
 
   // Derived.
   const isRecording = recordingState === 'recording';
@@ -293,13 +297,55 @@ function App(): React.ReactElement {
           title="Автопауза при остановке"
           subtitle={
             autoPauseEnabled
-              ? 'Включена: пауза при скорости < 0.35 м/с и смещении < 3.5 м за 10 с. Средний темп считается по чистому времени движения'
+              ? `Включена: пауза при скорости < ${autoPauseSpeedThresholdMps.toFixed(2)} м/с и смещении < ${autoPauseDisplacementThresholdM.toFixed(1)} м за ${autoPauseWindowMs / 1000} с. Средний темп считается по чистому времени движения`
               : 'Выключена: запись идёт непрерывно, даже когда вы стоите на месте'
           }
           value={autoPauseEnabled}
           onPress={() => useSettingsStore.getState().toggle('autoPauseEnabled')}
           disabled={settingsLocked}
         />
+
+        {/* Auto-pause variables exposed as text inputs (not +/− buttons) */}
+        {autoPauseEnabled && (
+          <>
+            <TextInputRow
+              label="Порог скорости (м/с)"
+              value={String(autoPauseSpeedThresholdMps)}
+              unit="м/с"
+              disabled={settingsLocked}
+              onChangeText={(text) => {
+                const v = parseFloat(text);
+                if (!isNaN(v)) {
+                  useSettingsStore.getState().set('autoPauseSpeedThresholdMps', v);
+                }
+              }}
+            />
+            <TextInputRow
+              label="Порог смещения (м)"
+              value={String(autoPauseDisplacementThresholdM)}
+              unit="м"
+              disabled={settingsLocked}
+              onChangeText={(text) => {
+                const v = parseFloat(text);
+                if (!isNaN(v)) {
+                  useSettingsStore.getState().set('autoPauseDisplacementThresholdM', v);
+                }
+              }}
+            />
+            <TextInputRow
+              label="Окно времени (с)"
+              value={String(autoPauseWindowMs / 1000)}
+              unit="с"
+              disabled={settingsLocked}
+              onChangeText={(text) => {
+                const v = parseFloat(text);
+                if (!isNaN(v)) {
+                  useSettingsStore.getState().set('autoPauseWindowMs', v * 1000);
+                }
+              }}
+            />
+          </>
+        )}
 
         <ToggleRow
           title="Разделение трека при потере сигнала"

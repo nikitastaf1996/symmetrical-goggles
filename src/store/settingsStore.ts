@@ -152,6 +152,38 @@ export const SETTINGS_SPEC = {
     nativeGet: () => GpsRecorder.getDouglasPeuckerEpsilonM(),
     nativeSet: (v: number) => GpsRecorder.setDouglasPeuckerEpsilonM(v),
   },
+  // Auto-pause variables — exposed to user as text inputs (not +/−) so
+  // decimal values like 0.35 can be typed directly.
+  autoPauseSpeedThresholdMps: {
+    type: 'number',
+    default: 0.35,
+    min: 0,
+    max: 5,
+    step: 0.01,
+    locked: true,
+    nativeGet: () => GpsRecorder.getAutoPauseSpeedThresholdMps(),
+    nativeSet: (v: number) => GpsRecorder.setAutoPauseSpeedThresholdMps(v),
+  },
+  autoPauseDisplacementThresholdM: {
+    type: 'number',
+    default: 3.5,
+    min: 0,
+    max: 50,
+    step: 0.1,
+    locked: true,
+    nativeGet: () => GpsRecorder.getAutoPauseDisplacementThresholdM(),
+    nativeSet: (v: number) => GpsRecorder.setAutoPauseDisplacementThresholdM(v),
+  },
+  autoPauseWindowMs: {
+    type: 'number',
+    default: 10000,
+    min: 1000,
+    max: 60000,
+    step: 100,
+    locked: true,
+    nativeGet: () => GpsRecorder.getAutoPauseWindowMs(),
+    nativeSet: (v: number) => GpsRecorder.setAutoPauseWindowMs(v),
+  },
 } as const;
 
 export type SettingKey = keyof typeof SETTINGS_SPEC;
@@ -174,6 +206,9 @@ type SettingsStoreState = {
   timeSamplingN: number;
   douglasPeuckerEnabled: boolean;
   douglasPeuckerEpsilonM: number;
+  autoPauseSpeedThresholdMps: number;
+  autoPauseDisplacementThresholdM: number;
+  autoPauseWindowMs: number;
 
   // Internal: re-entrancy guard. A second toggle while the first is
   // still awaiting its native round-trip would race with the optimistic
@@ -196,6 +231,12 @@ type SettingsStoreState = {
    */
   step: (key: SettingKey, delta: number) => Promise<void>;
 
+  /**
+   * Directly set a numeric setting value (used by text inputs for
+   * decimal values like 0.35). Clamps to spec range.
+   */
+  set: (key: SettingKey, value: number) => Promise<void>;
+
   /** Load all 11 settings from native prefs. Called once on mount. */
   loadAll: () => Promise<void>;
 };
@@ -213,6 +254,9 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
   timeSamplingN: SETTINGS_SPEC.timeSamplingN.default,
   douglasPeuckerEnabled: SETTINGS_SPEC.douglasPeuckerEnabled.default,
   douglasPeuckerEpsilonM: SETTINGS_SPEC.douglasPeuckerEpsilonM.default,
+  autoPauseSpeedThresholdMps: SETTINGS_SPEC.autoPauseSpeedThresholdMps.default,
+  autoPauseDisplacementThresholdM: SETTINGS_SPEC.autoPauseDisplacementThresholdM.default,
+  autoPauseWindowMs: SETTINGS_SPEC.autoPauseWindowMs.default,
   _updating: false,
 
   toggle: async (key) => {
@@ -264,6 +308,33 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
       set({ [key]: confirmed } as Partial<SettingsStoreState>);
     } catch (e: unknown) {
       set({ [key]: current } as Partial<SettingsStoreState>); // revert
+      useRecordingStore.getState().setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      set({ _updating: false });
+    }
+  },
+
+  set: async (key, value) => {
+    const spec = SETTINGS_SPEC[key];
+    if (spec.type !== 'number') return;
+    if (spec.locked) {
+      const recordingState = useRecordingStore.getState().recordingState;
+      if (recordingState === 'recording' || recordingState === 'stopping') return;
+    }
+    if (get()._updating) return;
+    set({ _updating: true });
+
+    const clamped = Math.max(spec.min, Math.min(spec.max, value));
+    if (clamped === get()[key]) {
+      set({ _updating: false });
+      return;
+    }
+    set({ [key]: clamped } as Partial<SettingsStoreState>); // optimistic
+    try {
+      const confirmed = await spec.nativeSet(clamped);
+      set({ [key]: confirmed } as Partial<SettingsStoreState>);
+    } catch (e: unknown) {
+      set({ [key]: get()[key] } as Partial<SettingsStoreState>); // revert
       useRecordingStore.getState().setError(e instanceof Error ? e.message : String(e));
     } finally {
       set({ _updating: false });

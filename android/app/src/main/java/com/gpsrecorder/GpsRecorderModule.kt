@@ -258,6 +258,38 @@ class GpsRecorderModule(private val reactContext: ReactApplicationContext) :
         settingsBridge.getShowMovingTimeEnabled(promise)
     }
 
+    // ---- Auto-pause variables (exposed to user as text inputs) ----
+
+    @ReactMethod
+    fun setAutoPauseSpeedThresholdMps(threshold: Double, promise: Promise) {
+        settingsBridge.setAutoPauseSpeedThresholdMps(threshold, promise)
+    }
+
+    @ReactMethod
+    fun getAutoPauseSpeedThresholdMps(promise: Promise) {
+        settingsBridge.getAutoPauseSpeedThresholdMps(promise)
+    }
+
+    @ReactMethod
+    fun setAutoPauseDisplacementThresholdM(threshold: Double, promise: Promise) {
+        settingsBridge.setAutoPauseDisplacementThresholdM(threshold, promise)
+    }
+
+    @ReactMethod
+    fun getAutoPauseDisplacementThresholdM(promise: Promise) {
+        settingsBridge.getAutoPauseDisplacementThresholdM(promise)
+    }
+
+    @ReactMethod
+    fun setAutoPauseWindowMs(windowMs: Int, promise: Promise) {
+        settingsBridge.setAutoPauseWindowMs(windowMs, promise)
+    }
+
+    @ReactMethod
+    fun getAutoPauseWindowMs(promise: Promise) {
+        settingsBridge.getAutoPauseWindowMs(promise)
+    }
+
     /**
      * Returns the current recording state, point count, elapsed time, last GPS fix,
      * total distance traveled, and current GNSS fix type. JS calls this on mount and

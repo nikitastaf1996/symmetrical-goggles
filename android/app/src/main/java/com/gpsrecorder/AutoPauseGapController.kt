@@ -76,14 +76,18 @@ class AutoPauseGapController(private val service: GpsRecorderService) {
         // displacement inside that window.
         internal const val RAW_WINDOW_MS = 10_000L
         // Instantaneous speed below which the user is considered stationary.
-        // 0.35 m/s ~ 1.26 km/h — a slow shuffle; anything below this is
-        // effectively standing still.
-        internal const val SPEED_THRESHOLD_MPS = 0.35f
+        // Read from user settings; default 0.35 m/s ~ 1.26 km/h.
+        internal fun speedThreshold(context: Context): Float =
+            GpsRecorderSettings.getAutoPauseSpeedThresholdMps(context)
         // Maximum pairwise displacement within the sliding window below
-        // which the user is considered stationary (i.e. not just bouncing
-        // in place due to GPS noise). 3.5 m ~ the diameter of a typical
-        // urban GPS noise bubble when standing still.
-        internal const val DISPLACEMENT_THRESHOLD_M = 3.5
+        // which the user is considered stationary. Read from user settings;
+        // default 3.5 m ~ typical urban GPS noise bubble when standing still.
+        internal fun displacementThreshold(context: Context): Float =
+            GpsRecorderSettings.getAutoPauseDisplacementThresholdM(context)
+        // Window duration for stop detection. Read from user settings;
+        // default 10 s.
+        internal fun windowMs(context: Context): Long =
+            GpsRecorderSettings.getAutoPauseWindowMs(context)
 
         // ---- Auto-pause exit hysteresis (CODE_REVIEW_TODO Task 2) ----
         // To prevent the amber "АВТОПАУЗА" banner from flickering on rapid
