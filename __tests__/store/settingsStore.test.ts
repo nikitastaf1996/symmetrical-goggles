@@ -14,9 +14,9 @@ import { gpsMock, clearGpsMock, resetStores } from '../helpers';
 import { renderHook } from '../helpers/renderHook';
 
 describe('settingsStore — SETTINGS_SPEC', () => {
-  it('defines all 11 settings', () => {
+  it('defines all 14 settings', () => {
     const keys = Object.keys(SETTINGS_SPEC);
-    expect(keys).toHaveLength(11);
+    expect(keys).toHaveLength(14);
     expect(keys).toEqual(
       expect.arrayContaining([
         'postProcessEnabled', 'gaussianSmoothingEnabled',
@@ -24,6 +24,7 @@ describe('settingsStore — SETTINGS_SPEC', () => {
         'radialDistanceFilterEnabled', 'radialDistanceThresholdM',
         'timeSamplingEnabled', 'timeSamplingN',
         'douglasPeuckerEnabled', 'douglasPeuckerEpsilonM',
+        'autoPauseSpeedThresholdMps', 'autoPauseDisplacementThresholdM', 'autoPauseWindowMs',
       ])
     );
   });
@@ -222,7 +223,7 @@ describe('settingsStore — loadAll', () => {
     clearGpsMock();
   });
 
-  it('loads all 11 settings from native prefs', async () => {
+  it('loads all 14 settings from native prefs', async () => {
     gpsMock.getPostProcessEnabled.mockResolvedValue(true);
     gpsMock.getGaussianSmoothingEnabled.mockResolvedValue(true);
     gpsMock.getAutoPauseEnabled.mockResolvedValue(true);
