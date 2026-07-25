@@ -46,7 +46,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { GnssPill } from './src/components/GnssPill';
 import { ToggleRow } from './src/components/ToggleRow';
 import { FilterSettingGroup } from './src/components/FilterSettingGroup';
-import { TextInputRow } from './src/components/TextInputRow';
+import { AutoPauseTextInput } from './src/components/AutoPauseTextInput';
 import { StatsDisplay } from './src/components/StatsDisplay';
 import { StartStopButton } from './src/components/StartStopButton';
 import { SavedCard } from './src/components/SavedCard';
@@ -308,40 +308,35 @@ function App(): React.ReactElement {
         {/* Auto-pause variables exposed as text inputs (not +/− buttons) */}
         {autoPauseEnabled && (
           <>
-            <TextInputRow
+            <AutoPauseTextInput
               label="Порог скорости (м/с)"
-              value={String(autoPauseSpeedThresholdMps)}
+              value={autoPauseSpeedThresholdMps}
               unit="м/с"
               disabled={settingsLocked}
-              onChangeText={(text) => {
-                const v = parseFloat(text);
-                if (!isNaN(v)) {
-                  useSettingsStore.getState().set('autoPauseSpeedThresholdMps', v);
-                }
+              onChange={(v: number | '') => {
+                if (v === '') return; // allow blank freely
+                useSettingsStore.getState().set('autoPauseSpeedThresholdMps', v);
               }}
             />
-            <TextInputRow
+            <AutoPauseTextInput
               label="Порог смещения (м)"
-              value={String(autoPauseDisplacementThresholdM)}
+              value={autoPauseDisplacementThresholdM}
               unit="м"
               disabled={settingsLocked}
-              onChangeText={(text) => {
-                const v = parseFloat(text);
-                if (!isNaN(v)) {
-                  useSettingsStore.getState().set('autoPauseDisplacementThresholdM', v);
-                }
+              onChange={(v: number | '') => {
+                if (v === '') return;
+                useSettingsStore.getState().set('autoPauseDisplacementThresholdM', v);
               }}
             />
-            <TextInputRow
+            <AutoPauseTextInput
               label="Окно времени (с)"
-              value={String(autoPauseWindowMs / 1000)}
+              value={autoPauseWindowMs}
               unit="с"
+              displayValue={(v) => String(v / 1000)}
               disabled={settingsLocked}
-              onChangeText={(text) => {
-                const v = parseFloat(text);
-                if (!isNaN(v)) {
-                  useSettingsStore.getState().set('autoPauseWindowMs', v * 1000);
-                }
+              onChange={(v: number | '') => {
+                if (v === '') return;
+                useSettingsStore.getState().set('autoPauseWindowMs', v * 1000);
               }}
             />
           </>

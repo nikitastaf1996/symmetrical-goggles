@@ -324,7 +324,7 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
     if (get()._updating) return;
     set({ _updating: true });
 
-    const clamped = Math.max(spec.min, Math.min(spec.max, value));
+    const clamped = value; // no clamp — user can enter any value
     if (clamped === get()[key]) {
       set({ _updating: false });
       return;
