@@ -75,6 +75,9 @@ describe('settingsStore — initial state', () => {
     expect(s.radialDistanceThresholdM).toBe(5);
     expect(s.timeSamplingEnabled).toBe(false);
     expect(s.timeSamplingN).toBe(5);
+    expect(s.autoPauseSpeedThresholdMps).toBe(0.35);
+    expect(s.autoPauseDisplacementThresholdM).toBe(3.5);
+    expect(s.autoPauseWindowMs).toBe(10000);
     expect(s.douglasPeuckerEnabled).toBe(false);
     expect(s.douglasPeuckerEpsilonM).toBe(5);
   });
@@ -217,6 +220,33 @@ describe('settingsStore — step (numeric)', () => {
   });
 });
 
+describe('settingsStore — set (numeric direct set)', () => {
+  beforeEach(() => {
+    resetStores();
+    clearGpsMock();
+  });
+
+  it('sets and clamps a numeric value directly', async () => {
+    gpsMock.setAutoPauseSpeedThresholdMps.mockResolvedValue(0.5);
+    await useSettingsStore.getState().set('autoPauseSpeedThresholdMps', 0.5);
+    expect(useSettingsStore.getState().autoPauseSpeedThresholdMps).toBe(0.5);
+    expect(gpsMock.setAutoPauseSpeedThresholdMps).toHaveBeenCalledWith(0.5);
+  });
+
+  it('clamps to min/max on direct set', async () => {
+    gpsMock.getAutoPauseWindowMs.mockResolvedValue(1000);
+    gpsMock.setAutoPauseWindowMs.mockResolvedValue(1000);
+    await useSettingsStore.getState().set('autoPauseWindowMs', 500);
+    expect(useSettingsStore.getState().autoPauseWindowMs).toBe(1000); // clamped to min
+  });
+
+  it('skips direct set when locked during recording', async () => {
+    useRecordingStore.setState({ recordingState: 'recording' });
+    await useSettingsStore.getState().set('autoPauseDisplacementThresholdM', 10);
+    expect(gpsMock.setAutoPauseDisplacementThresholdM).not.toHaveBeenCalled();
+  });
+});
+
 describe('settingsStore — loadAll', () => {
   beforeEach(() => {
     resetStores();
@@ -235,6 +265,9 @@ describe('settingsStore — loadAll', () => {
     gpsMock.getTimeSamplingN.mockResolvedValue(7);
     gpsMock.getDouglasPeuckerEnabled.mockResolvedValue(true);
     gpsMock.getDouglasPeuckerEpsilonM.mockResolvedValue(15);
+    gpsMock.getAutoPauseSpeedThresholdMps.mockResolvedValue(0.35);
+    gpsMock.getAutoPauseDisplacementThresholdM.mockResolvedValue(3.5);
+    gpsMock.getAutoPauseWindowMs.mockResolvedValue(10000);
 
     await useSettingsStore.getState().loadAll();
 
@@ -250,6 +283,9 @@ describe('settingsStore — loadAll', () => {
     expect(s.timeSamplingN).toBe(7);
     expect(s.douglasPeuckerEnabled).toBe(true);
     expect(s.douglasPeuckerEpsilonM).toBe(15);
+    expect(s.autoPauseSpeedThresholdMps).toBe(0.35);
+    expect(s.autoPauseDisplacementThresholdM).toBe(3.5);
+    expect(s.autoPauseWindowMs).toBe(10000);
   });
 
   it('keeps spec defaults when a native getter fails', async () => {

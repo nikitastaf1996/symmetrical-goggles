@@ -85,6 +85,12 @@ const gpsRecorderMock = {
   getGapDetectionEnabled: jest.fn().mockResolvedValue(true),
   setShowMovingTimeEnabled: jest.fn().mockResolvedValue(true),
   getShowMovingTimeEnabled: jest.fn().mockResolvedValue(false),
+  setAutoPauseSpeedThresholdMps: jest.fn().mockResolvedValue(0.35),
+  getAutoPauseSpeedThresholdMps: jest.fn().mockResolvedValue(0.35),
+  setAutoPauseDisplacementThresholdM: jest.fn().mockResolvedValue(3.5),
+  getAutoPauseDisplacementThresholdM: jest.fn().mockResolvedValue(3.5),
+  setAutoPauseWindowMs: jest.fn().mockResolvedValue(10000),
+  getAutoPauseWindowMs: jest.fn().mockResolvedValue(10000),
   addListener: jest.fn(),
   removeListeners: jest.fn(),
 };

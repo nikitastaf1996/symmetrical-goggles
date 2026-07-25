@@ -71,6 +71,12 @@ export function clearGpsMock(): void {
     getGapDetectionEnabled: true,
     setShowMovingTimeEnabled: true,
     getShowMovingTimeEnabled: false,
+    setAutoPauseSpeedThresholdMps: 0.35,
+    getAutoPauseSpeedThresholdMps: 0.35,
+    setAutoPauseDisplacementThresholdM: 3.5,
+    getAutoPauseDisplacementThresholdM: 3.5,
+    setAutoPauseWindowMs: 10000,
+    getAutoPauseWindowMs: 10000,
   };
   for (const k of Object.keys(gpsMock)) {
     const fn = gpsMock[k];
@@ -167,6 +173,9 @@ export function resetStores(): void {
     timeSamplingN: 5,
     douglasPeuckerEnabled: false,
     douglasPeuckerEpsilonM: 5,
+    autoPauseSpeedThresholdMps: 0.35,
+    autoPauseDisplacementThresholdM: 3.5,
+    autoPauseWindowMs: 10000,
     _updating: false,
   });
 }
